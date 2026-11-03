@@ -112,8 +112,7 @@ it.
   written into the hook would be a second pin: `sltk update` would have to
   rewrite the hook and `sltk check` compare the two. That is the double pin
   the hand-copied hooks carry. The hook stays the same file in every
-  repository. A spike read arcl 0.3.0 from a test `sltk.toml` this way and
-  installed it in a Claude cloud session.
+  repository.
 - `sltk init` adopts a repository that is already set up. It keeps the
   settings in `.github/fabrial.toml` and runs `fab update`, replaces a copied
   `session-start.sh`, and rewrites the Tasks section in place. It runs
@@ -182,6 +181,9 @@ it.
   none beside `arcl-cli-installer.sh`, and a `sha256.sum` that lists no
   installer.
 - `.github/fabrial.toml` in each repository: the fab version each pins.
+- The prototype session hook in PR #4: it read arcl 0.3.0 from a test
+  `sltk.toml` with the shell one-liner and installed it in a Claude cloud
+  session.
 - `dalil/.claude/hooks/session-start.sh`,
   `fabrial/.claude/hooks/session-start.sh` and `cloud/scripts/dev-setup.sh`:
   the hand-copied pins.

@@ -1,7 +1,7 @@
 +++
 id = "arcl-c-01M6H45BG8J7N2QMTDDSJB3BNW"
 title = "Decide how the session hook verifies the sltk download"
-status = "captured"
+status = "discarded"
 created-at = "2026-11-03T16:34:01.352Z"
 +++
 

@@ -5,7 +5,7 @@ title = "Write the Tasks section and the session hook"
 status = "pending"
 priority = "normal"
 position = 3
-blocked-by = ["arcl-t-01M6H2B5327WG5DQR0Q41P2DWZ", "arcl-t-01M6H2B546VDAZG9A2RKMMQK00"]
+blocked-by = ["arcl-t-01M6H2B5327WG5DQR0Q41P2DWZ", "arcl-t-01M6H2B546VDAZG9A2RKMMQK00", "arcl-t-01M6H4C5Z4PQ6WKD582Y05H1KJ"]
 +++
 
 dalil, fabrial and stack each carry a
