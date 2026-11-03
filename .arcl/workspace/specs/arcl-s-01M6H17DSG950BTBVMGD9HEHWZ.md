@@ -106,6 +106,14 @@ it.
   `.github/sltk.toml`, then builds the arcl cache. It replaces the hand-copied
   `session-start.sh`. cloud's `dev-setup.sh` calls `sltk` for fab and arcl and
   keeps installing its other tools itself.
+- The hook reads the `sltk` version from `.github/sltk.toml` with a shell
+  one-liner, so the version lives in one place. `sltk` writes it as one line,
+  `version = "x.y.z"`, and the hook fails when it finds none. A version
+  written into the hook would be a second pin: `sltk update` would have to
+  rewrite the hook and `sltk check` compare the two. That is the double pin
+  the hand-copied hooks carry. The hook stays the same file in every
+  repository. A spike read arcl 0.3.0 from a test `sltk.toml` this way and
+  installed it in a Claude cloud session.
 - `sltk init` adopts a repository that is already set up. It keeps the
   settings in `.github/fabrial.toml` and runs `fab update`, replaces a copied
   `session-start.sh`, and rewrites the Tasks section in place. It runs
@@ -154,10 +162,6 @@ it.
 
 ## Open
 
-- The session hook installs `sltk` before `.github/sltk.toml` can be read by
-  `sltk`. The hook needs the version some other way: read the file with a
-  shell one-liner, or write the version into the hook when `sltk init` writes
-  it. A spike of the hook settles it.
 - Whether `sltk install` on a Mac with Homebrew warns about, or offers to
   remove, a brew-installed `fab`, `arcl` or `mire`. The first adoption on the
   owner's Mac settles it.
