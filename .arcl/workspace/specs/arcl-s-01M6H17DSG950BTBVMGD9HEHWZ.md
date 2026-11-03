@@ -18,9 +18,10 @@ drifted:
   mire and 0.4.0 in arclightning.
 - `arcl skill install` was never run in dalil, and mire's copy of the
   arclightning skill differs from the one in arclightning's `skills/`.
-- dalil and fabrial carry the same `.claude/hooks/session-start.sh`, copied by
-  hand, and it pins arcl 0.3.0 in two places: the script and the AGENTS.md
-  Tasks section.
+- dalil and fabrial each carry a `.claude/hooks/session-start.sh` copied by
+  hand; the two differ only in comments. Each pins arcl 0.3.0 twice: in the
+  script, and in dalil's AGENTS.md Tasks section or fabrial's PLAN.md Work
+  section.
 - cloud's `scripts/dev-setup.sh` pins fab and arcl a third way.
 
 Each binary already has a one-line install. fab, arcl and mire all release
@@ -33,10 +34,9 @@ it.
 
 ### The tool
 
-- `sltk` is its own tool in `stormlightlabs/stack`, separate from fab. fab
-  installs nothing that names a tracker, and a test in
-  `crates/fab-core/src/install.rs` fails if it does, so code that combines fab
-  with arcl cannot live in fabrial.
+- `sltk` is its own tool in `stormlightlabs/stack`, separate from fab.
+  fabrial's PLAN.md decides that fabrial depends on no tracker and links no
+  tracker's code, so code that combines fab with arcl does not belong there.
 - The binary is `sltk`. Haskell's Stack already installs `stack`, and `stk` is
   taken in Homebrew. `sltk` is free in Homebrew and on crates.io.
 - It is written in Rust, in two crates. `sltk-core` reads the release train
@@ -57,7 +57,8 @@ it.
   ticking it in the picker, where it starts unticked. It needs no setup in a
   repository.
 - A tool joins with an entry in the release train: its name, tier, binary,
-  download URL template, platforms and setup commands. dalil can join that
+  download URL template, platforms, the sha256 of each platform's archive and
+  setup commands. dalil can join that
   way once it has a release. A tool that needs written glue, as arcl needs the
   Tasks section, also needs code in `sltk`.
 - A repository set up by `sltk` cannot use fab with a tracker other than
@@ -74,9 +75,13 @@ it.
 
 ### Machine install
 
-- `sltk install` downloads each tool's dist installer from the release the
-  train pins, checks it against the sha256 that dist publishes, and installs
-  the tool into `~/.cargo/bin`.
+- `sltk install` downloads each tool's release archive for the platform from
+  the release the train pins, checks it against the sha256 the train pins, and
+  unpacks the binary into `~/.cargo/bin`. It does not run dist's installer
+  script: dist publishes a sha256 for each archive but none for the script.
+- A train pull request copies each archive's sha256 from the `.sha256` file
+  dist publishes beside it. Pinning the hash in `train.toml` also catches an
+  asset uploaded again after the train was tested.
 - A machine holds one version of each tool. `sltk check` reports when a
   repository's pin differs from what is installed.
 - Tools come from their GitHub releases, never from Homebrew: the tap holds
@@ -91,18 +96,21 @@ it.
 - A repository records its pin in `.github/sltk.toml`: the train version and
   the optional tools it chose. The essentials are implied.
 - `sltk init` runs each tool's own setup: `fab init`, `arcl init --workspace`
-  and `arcl skill install`. It writes only the glue itself: the AGENTS.md
-  Tasks section and one session hook. Writing fab's or arcl's files directly
-  would copy their templates, and those copies are the drift this tool
-  removes.
+  and `arcl skill install`. `fab init` requires `--owner`, `--trailer` and
+  `--gates`, so on a fresh repository `sltk init` takes the same three flags,
+  asks for any left out when on a terminal, and passes them to `fab init`.
+- `sltk init` writes only the glue itself: the AGENTS.md Tasks section and
+  one session hook. Writing fab's or arcl's files directly would copy their
+  templates, and those copies are the drift this tool removes.
 - The session hook installs the pinned `sltk`, runs `sltk install --yes` from
   `.github/sltk.toml`, then builds the arcl cache. It replaces the hand-copied
   `session-start.sh`. cloud's `dev-setup.sh` calls `sltk` for fab and arcl and
   keeps installing its other tools itself.
 - `sltk init` adopts a repository that is already set up. It keeps the
   settings in `.github/fabrial.toml` and runs `fab update`, replaces a copied
-  `session-start.sh`, rewrites the Tasks section in place and runs
-  `arcl skill install` where the skill is missing. It shows the diff and
+  `session-start.sh`, and rewrites the Tasks section in place. It runs
+  `arcl skill install --check`, which exits 4 when a skill file is missing or
+  differs, and runs `arcl skill install` when it does. It shows the diff and
   changes nothing without `--yes` or a yes at the prompt.
 - `sltk update` moves a repository to a newer train. `sltk check` reports
   drift across every tool and exits 1 when there is any.
@@ -110,8 +118,8 @@ it.
 
 ### Doctor
 
-- `sltk doctor` reports missing tools, wrong versions and a `fab` from
-  Homebrew that comes before the pinned one on `PATH`.
+- `sltk doctor` reports missing tools, wrong versions and a `fab`, `arcl` or
+  `mire` from Homebrew that comes before the pinned one on `PATH`.
 - When `gh` is installed it also checks the repository: stormlight-thunderbot
   installed, `THUNDERBOT_APP_ID` and `THUNDERBOT_PRIVATE_KEY` available, and
   `storm/review` required on `main`. Without `gh` it skips these and says so.
@@ -156,15 +164,22 @@ it.
 
 ## Sources
 
-- `fabrial/crates/fab-core/src/install.rs`, test
-  `installed_files_name_no_task_tracker`: fab installs nothing that names arcl.
+- `fabrial/PLAN.md`, decision "A task source owns the work, and fabrial
+  depends on none": fabrial names no tracker and links no tracker's code.
 - `fabrial/dist-workspace.toml`, `arclightning/dist-workspace.toml`,
   `mire/dist-workspace.toml`: cargo-dist 0.32, the shared tap, `CARGO_HOME`,
   and each tool's targets.
 - `arclightning/crates/arcl-cli/src/app/skill.rs`: `arcl skill install` writes
-  the skill into `.claude/skills` and `.agents/skills`.
+  the skill into `.claude/skills` and `.agents/skills`; `--check` writes
+  nothing and exits 4 when a file is missing or differs.
+- `fab init --help` in fab 0.8.0: `--owner`, `--trailer` and `--gates` are
+  required.
+- The assets of arcl's v0.3.0 release: a `.sha256` file beside each archive,
+  none beside `arcl-cli-installer.sh`, and a `sha256.sum` that lists no
+  installer.
 - `.github/fabrial.toml` in each repository: the fab version each pins.
-- `dalil/.claude/hooks/session-start.sh` and `cloud/scripts/dev-setup.sh`: the
-  hand-copied pins.
+- `dalil/.claude/hooks/session-start.sh`,
+  `fabrial/.claude/hooks/session-start.sh` and `cloud/scripts/dev-setup.sh`:
+  the hand-copied pins.
 - formulae.brew.sh and crates.io, checked 2026-11-03: `stk` is a Homebrew
   formula and a crate; `sltk` is neither.
