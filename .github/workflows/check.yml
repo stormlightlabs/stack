@@ -1,8 +1,9 @@
 # The check a pull request into main must pass: the `check` job runs
 # `just check`. It installs the fab release .github/fabrial.toml names and the
-# arcl release AGENTS.md pins, and builds arcl's database from the committed
-# workspace. A newer push to the same pull request cancels the run still
-# going. The run on main builds the cache that pull requests restore.
+# arcl release pinned below, in AGENTS.md and in the session hook; a bump
+# changes all three. It builds arcl's database from the committed workspace.
+# A newer push to the same pull request cancels the run still going. The run
+# on main builds the cache that pull requests restore.
 name: Check
 
 on:
