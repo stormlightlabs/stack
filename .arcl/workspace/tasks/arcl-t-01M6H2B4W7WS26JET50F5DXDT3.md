@@ -2,7 +2,7 @@
 id = "arcl-t-01M6H2B4W7WS26JET50F5DXDT3"
 parent = "arcl-t-01M6H2B4TM52T6A1YW2V1TVPVB"
 title = "Scaffold the sltk workspace and its gate"
-status = "pending"
+status = "in_progress"
 priority = "normal"
 position = 0
 +++

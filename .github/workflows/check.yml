@@ -1,0 +1,50 @@
+# The check a pull request into main must pass: the `check` job runs
+# `just check`. It installs the fab release .github/fabrial.toml names and the
+# arcl release AGENTS.md pins, and builds arcl's database from the committed
+# workspace. A newer push to the same pull request cancels the run still
+# going. The run on main builds the cache that pull requests restore.
+name: Check
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: extractions/setup-just@v3
+        with:
+          just-version: 1.40.0
+
+      - uses: ./.github/actions/fab
+        with:
+          command: check
+
+      # AGENTS.md's Tasks section names the same arcl release.
+      - name: Install arcl
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/stormlightlabs/arclightning/releases/download/v0.3.0/arcl-cli-installer.sh | sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - run: arcl init --quiet
+
+      - run: just check

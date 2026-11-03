@@ -7,11 +7,13 @@ with Mire as an option, onto a machine and into a repository. Its CLI is
 ## Gates
 
 ```sh
-just check    # fab check and arcl check; fmt, clippy and tests join with the code
+just check    # fmt --check, clippy with warnings denied, tests, fab check, arcl check
 ```
 
-`gates` in `.github/fabrial.toml` names this command. CI will run the same
-recipe as the `check` job.
+It needs Rust, `fab` and `arcl`, and a fresh checkout needs `arcl init` first.
+`gates` in `.github/fabrial.toml` names this command. CI runs the same recipe
+as the `check` job. Clippy warnings fail it whether or not your change caused
+them.
 
 ## Commits
 
