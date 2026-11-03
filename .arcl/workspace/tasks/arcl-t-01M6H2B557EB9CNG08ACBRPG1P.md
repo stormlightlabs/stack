@@ -12,11 +12,13 @@ fabrial and arcl, showing the diff before it writes.
 
 ## Stop rule
 
-The stack repository runs on files `sltk init`
-wrote, merged through its own PR.
+In a test, on a copy of a repository set up by hand, `sltk init`
+without `--yes` changes nothing, and `sltk init --yes` leaves `fab
+check` and `arcl check` passing.
 
 ## Must not absorb
 
-Adopting repositories other than stack.
+Adopting real repositories. stack adopts itself in v0.3, once 0.2.0
+is released.
 
 Source: the `storm stack` spec (arcl-s-01M6H17DSG950BTBVMGD9HEHWZ).

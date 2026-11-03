@@ -5,7 +5,7 @@ title = "Embed the release train in train.toml"
 status = "pending"
 priority = "normal"
 position = 0
-blocked-by = ["arcl-t-01M6H2B4WS2TSFRVNYFPDGZYGJ"]
+blocked-by = ["arcl-t-01M6H2B4W7WS26JET50F5DXDT3"]
 +++
 
 Each repository pins tool versions by hand,
@@ -15,17 +15,21 @@ and the pins have drifted (fab 0.8.0, 0.7.1,
 
 ## Done when
 
-`train.toml` lists fab, arcl and mire with
-tier, binary, version, a download URL template
-and the sha256 of each supported platform's
-archive, copied from dist's `.sha256` files.
+`train.toml` lists fab, arcl and mire, each
+with tier, binary, version, a download URL
+template, platforms, the sha256 of each
+platform's archive, copied from dist's
+`.sha256` files, and setup commands: `fab
+init` for fab, `arcl init --workspace` and
+`arcl skill install` for arcl, none for mire.
 `sltk-core` parses it, and `sltk train` prints
 the pinned set. Tests reject a train with a
 missing hash or an unknown tier.
 
 ## Not in this task
 
-Downloading anything.
+Downloading anything. Running the setup
+commands.
 
 ## Paths
 

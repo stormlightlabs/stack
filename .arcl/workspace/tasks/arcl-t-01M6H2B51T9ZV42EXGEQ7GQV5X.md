@@ -14,8 +14,9 @@ pin, the Tasks section and the session hook.
 
 In an empty git repository, `sltk init --owner o
 --trailer 'N <e>' --gates 'just check' --yes` leaves a
-repository where `fab check` and `arcl check` pass, and
-a cloud session there gets arcl from the hook.
+repository where `fab check` and `arcl check` pass. A test
+runs the hook it wrote with a locally built `sltk` and finds
+arcl installed.
 
 ## Must not absorb
 

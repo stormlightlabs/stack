@@ -11,8 +11,9 @@ Report drift and move repositories to newer trains.
 
 ## Stop rule
 
-`sltk check` exits 1 on any drift, `sltk update`
-clears it, and a train PR runs the smoke test in CI.
+`sltk check` exits 1 on any drift and passes after `sltk update`
+and `sltk install --yes`, and a train PR runs the smoke test in
+CI.
 
 ## Must not absorb
 

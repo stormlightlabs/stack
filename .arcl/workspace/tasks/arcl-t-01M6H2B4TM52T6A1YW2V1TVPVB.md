@@ -12,9 +12,10 @@ release pipeline that publishes it like fab and arcl.
 
 ## Stop rule
 
-A tag on `main` produces a GitHub release of `sltk`
-with dist archives and a formula in
-`stormlightlabs/homebrew-tap`.
+`just check` passes in CI, `dist plan` passes, and the
+Release PR, Release tag and `publish-homebrew.yml`
+workflows are on `main`. Cutting a release belongs to
+`Cut the 0.1.0 release`.
 
 ## Must not absorb
 

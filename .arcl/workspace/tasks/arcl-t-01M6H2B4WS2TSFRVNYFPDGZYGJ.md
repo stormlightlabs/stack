@@ -25,8 +25,8 @@ token. Targets are `aarch64-apple-darwin` and
 
 ## Not in this task
 
-Cutting the 0.1.0 release itself; that
-happens when the phase's units are done.
+Cutting the 0.1.0 release itself; that is
+`Cut the 0.1.0 release`.
 
 ## Paths
 

@@ -9,9 +9,9 @@ position = 1
 `sltk init` sets up a fresh repository and adopts one already set
 up by hand.
 
-The hook spike runs first: the hook writer depends on its answer.
-The setup unit lands before the adoption unit, which reuses its
-writers. Both units write AGENTS.md and `.claude/`, so do not run
-them at once.
+The hook spike can run now: the hook writer depends on its
+answer. The setup unit lands before the adoption unit, which
+reuses its writers. Both units write AGENTS.md and `.claude/`, so
+do not run them at once. `Cut the 0.2.0 release` runs last.
 
 Source: the `storm stack` spec (arcl-s-01M6H17DSG950BTBVMGD9HEHWZ).

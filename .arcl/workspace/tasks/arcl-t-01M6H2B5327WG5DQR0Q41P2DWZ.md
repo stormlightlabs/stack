@@ -13,13 +13,18 @@ install `sltk` before `sltk` can read
 one-liner that reads the file, or a version
 written into the hook by `sltk init`.
 
+No `sltk` release exists yet, so the prototype
+installs arcl 0.3.0 in its place: a binary from
+an existing GitHub release, at a pinned version.
+
 ## Done when
 
 A recorded decision: the spec's Open item is
 replaced by a line under Repository setup, with
-the reason. A prototype hook ran in one Claude
-cloud session and the result is in the PR
-comment.
+the reason. A prototype hook that installs the
+pinned arcl 0.3.0 binary from its GitHub release
+ran in one Claude cloud session, and the result
+is in the PR comment.
 
 ## Not in this task
 

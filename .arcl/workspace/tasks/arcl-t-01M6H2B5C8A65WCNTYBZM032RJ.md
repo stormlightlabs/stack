@@ -17,12 +17,13 @@ Repositories need one command to follow it.
 version into the pin, runs `fab update`, then
 the glue writers, and shows the diff first as
 adoption does. It refuses to move to an older
-train. `sltk check` passes afterwards in the
-test.
+train. In a test, after `sltk update` and
+`sltk install --yes`, `sltk check` passes.
 
 ## Not in this task
 
-Installing tools on the machine.
+Installing tools on the machine; `sltk
+install` does that.
 
 ## Paths
 

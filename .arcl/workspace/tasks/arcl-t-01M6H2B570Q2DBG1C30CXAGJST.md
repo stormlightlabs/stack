@@ -1,16 +1,17 @@
 +++
 id = "arcl-t-01M6H2B570Q2DBG1C30CXAGJST"
-parent = "arcl-t-01M6H2B557EB9CNG08ACBRPG1P"
+parent = "arcl-t-01M6H2MVMRF8AZPZ74AW39TASJ"
 title = "Adopt the stack repository with sltk init"
 status = "pending"
 priority = "normal"
-position = 1
-blocked-by = ["arcl-t-01M6H2B56F01QNVYY5C5K1CPPH"]
+position = 0
+blocked-by = ["arcl-t-01M6H2B56F01QNVYY5C5K1CPPH", "arcl-t-01M6H2NG81PEP6PQGMMW1E51PZ"]
 +++
 
 stack's hook and Tasks section were copied
 from dalil at bootstrap. The spec says stack
-adopts itself once the CLI can.
+adopts itself once the CLI can, which
+is once 0.2.0 is released.
 
 ## Done when
 

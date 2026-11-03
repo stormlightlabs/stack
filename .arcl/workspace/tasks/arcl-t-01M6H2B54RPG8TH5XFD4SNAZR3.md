@@ -20,7 +20,10 @@ session-start.sh` and its entry in
 `.claude/settings.json`, as the spike decided.
 Running it twice changes nothing the second
 time. The hook installs `sltk`, runs `sltk
-install --yes` and builds the arcl cache.
+install --yes` and builds the arcl cache. A
+test runs the written hook with a locally built
+`sltk` in place of the download and finds arcl
+installed.
 
 ## Not in this task
 

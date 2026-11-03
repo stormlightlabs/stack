@@ -6,6 +6,10 @@ status = "open"
 [[members]]
 kind = "task"
 id = "arcl-t-01M6H2B5HXT7RYFSWNKNJQZNDC"
+
+[[members]]
+kind = "task"
+id = "arcl-t-01M6H2NGA0YZ3FMZDZJPTPJQV5"
 +++
 
 The `v0.4: rollout` phase of the storm stack plan.
