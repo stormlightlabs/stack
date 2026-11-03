@@ -5,4 +5,4 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "Plans what sltk installs onto a machine and writes into a repository"
+description = "The release number sltk reports"

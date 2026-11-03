@@ -28,6 +28,6 @@ mod tests {
     fn version_prints_the_name_and_release() {
         let err = Cli::command().try_get_matches_from(["sltk", "--version"]).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DisplayVersion);
-        assert_eq!(err.to_string(), "sltk 0.0.0\n");
+        assert_eq!(err.to_string(), format!("sltk {}\n", env!("CARGO_PKG_VERSION")));
     }
 }
