@@ -2,9 +2,10 @@
 id = "arcl-t-01M6H2B5327WG5DQR0Q41P2DWZ"
 parent = "arcl-t-01M6H2B51T9ZV42EXGEQ7GQV5X"
 title = "Decide how the session hook learns the sltk version"
-status = "in_progress"
+status = "completed"
 priority = "normal"
 position = 0
+evidence = "Done in #4 at 1dce6b5: the hook reads version from .github/sltk.toml with a shell one-liner, recorded under Repository setup; a prototype hook installed arcl 0.3.0 from its release in a Claude cloud session, posted on #4."
 +++
 
 The spec leaves this open: the hook must
