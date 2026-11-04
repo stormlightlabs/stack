@@ -1,0 +1,16 @@
+[package]
+name = "sltk-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Installs the storm stack onto a machine and into a repository"
+
+[[bin]]
+name = "sltk"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+sltk-core = { path = "../sltk-core" }
