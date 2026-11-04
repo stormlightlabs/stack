@@ -1,0 +1,24 @@
+# Release config for dist (https://axodotdev.github.io/cargo-dist). Edit it,
+# then run `dist generate` to regenerate .github/workflows/release.yml.
+
+[workspace]
+members = ["cargo:."]
+
+[dist]
+# The dist version CI installs (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+ci = "github"
+installers = ["shell", "homebrew"]
+# The Homebrew tap the formula goes to, and its name there
+tap = "stormlightlabs/homebrew-tap"
+formula = "sltk"
+# Publish the formula with a thunderbot token minted for the tap
+# (.github/workflows/publish-homebrew.yml), not a stored personal token
+publish-jobs = ["./publish-homebrew"]
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# Installers put sltk in ~/.cargo/bin, beside fab, arcl and mire
+install-path = "CARGO_HOME"
+install-updater = false
+# Pull requests only run `dist plan`, which fails when release.yml differs
+# from what this config generates; nothing builds or publishes.
+pr-run-mode = "plan"

@@ -2,7 +2,7 @@
 id = "arcl-t-01M6H2B4WS2TSFRVNYFPDGZYGJ"
 parent = "arcl-t-01M6H2B4TM52T6A1YW2V1TVPVB"
 title = "Release sltk with cargo-dist and the Homebrew tap"
-status = "pending"
+status = "in_progress"
 priority = "normal"
 position = 1
 blocked-by = ["arcl-t-01M6H2B4W7WS26JET50F5DXDT3"]

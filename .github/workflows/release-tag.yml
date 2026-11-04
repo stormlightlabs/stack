@@ -1,0 +1,82 @@
+# Tags a release when the Release PR workflow's pull request merges: the push to
+# main raises the workspace version, and GitHub names storm/release-<version>
+# as the merged pull request behind the commit, whatever its squash message
+# says. It tags v<version> on the merge commit the owner approved, which
+# starts the dist workflow (release.yml): that builds sltk and publishes the
+# GitHub release with the version's section of CHANGELOG.md. A revert or a
+# hand edit of the version tags nothing. To tag a release merge a run missed,
+# run this from the Actions tab with that commit; a re-run uses the workflow as
+# it was at that commit.
+name: Release tag
+
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.toml]
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: The release pull request's merge commit on main
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: app
+        with:
+          app-id: ${{ secrets.THUNDERBOT_APP_ID }}
+          private-key: ${{ secrets.THUNDERBOT_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+          fetch-depth: 2
+
+      # A dispatched commit must be on main before anything from it runs
+      # with the App token: the next step installs the fab release its
+      # .github/fabrial.toml names.
+      - name: Check the commit is on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          status=$(gh api "repos/$REPO/compare/$sha...main" --jq .status)
+          if [[ $status != ahead && $status != identical ]]; then
+            echo "::error title=release::$sha is not on main; nothing was tagged."
+            exit 1
+          fi
+
+      - uses: ./.github/actions/fab
+        with:
+          command: release
+
+      - name: Tag
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          # `fab release check-tag` prints the version when this commit is
+          # the merge of its release pull request, and nothing when there is
+          # nothing to tag; it fails on a commit off main, a version raised
+          # outside a release pull request, a tag on another commit, or no
+          # notes in CHANGELOG.md.
+          version=$(fab release check-tag)
+          if [[ -z $version ]]; then
+            exit 0
+          fi
+          # dist's Release workflow builds this commit once the tag exists, and
+          # a tag cannot be moved, so check its plan here first: a dist change
+          # merged after the release PR could leave release.yml stale.
+          dist_version=$(sed -n 's/^cargo-dist-version = "\(.*\)"$/\1/p' dist-workspace.toml)
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            "https://github.com/axodotdev/cargo-dist/releases/download/v$dist_version/cargo-dist-installer.sh" | sh
+          "$HOME/.cargo/bin/dist" plan --tag "v$version" >/dev/null
+          # The App token's tag push starts the dist workflow; a push made with
+          # GITHUB_TOKEN would not.
+          gh api "repos/$REPO/git/refs" -f "ref=refs/tags/v$version" -f "sha=$(git rev-parse HEAD)" >/dev/null
