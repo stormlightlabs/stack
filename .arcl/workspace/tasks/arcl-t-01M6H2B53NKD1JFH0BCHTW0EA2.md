@@ -17,7 +17,12 @@ optional tools in `.github/sltk.toml`.
 `.github/sltk.toml` with `version` and
 `optional`. Writing then reading returns the
 same value, and an unknown tool name is an
-error that names it.
+error that names it. The written file has
+`version` as the exact line
+`version = "x.y.z"`, which the session hook
+reads, and a test checks that line. Reading a
+file without that exact line is an error that
+names it.
 
 ## Not in this task
 
