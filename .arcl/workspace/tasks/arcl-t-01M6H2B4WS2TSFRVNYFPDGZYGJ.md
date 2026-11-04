@@ -2,10 +2,11 @@
 id = "arcl-t-01M6H2B4WS2TSFRVNYFPDGZYGJ"
 parent = "arcl-t-01M6H2B4TM52T6A1YW2V1TVPVB"
 title = "Release sltk with cargo-dist and the Homebrew tap"
-status = "in_progress"
+status = "completed"
 priority = "normal"
 position = 1
 blocked-by = ["arcl-t-01M6H2B4W7WS26JET50F5DXDT3"]
+evidence = "Done in #6 at 2a478ff: dist-workspace.toml (cargo-dist 0.32.0, both targets, formula sltk); dist plan passed in CI; Release PR, Release tag and publish-homebrew workflows modelled on fabrial's; first real run is the 0.1.0 cut."
 +++
 
 fab, arcl and mire release with cargo-dist
