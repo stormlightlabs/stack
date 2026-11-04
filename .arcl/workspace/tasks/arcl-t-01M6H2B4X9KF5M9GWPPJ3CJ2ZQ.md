@@ -13,8 +13,9 @@ tools the embedded train pins.
 ## Stop rule
 
 On macOS ARM and Linux x86-64, `sltk install --yes`
-leaves fab 0.8.0 and arcl 0.3.0 in `~/.cargo/bin`, and
-`--with mire` adds mire. A wrong hash installs nothing.
+leaves fab 0.8.0 and arcl 0.3.0 in `~/.cargo/bin`.
+The install task's fixture test covers `--with mire`.
+A wrong hash installs nothing.
 
 ## Must not absorb
 

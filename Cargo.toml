@@ -11,3 +11,6 @@ homepage = "https://github.com/stormlightlabs/stack"
 
 [workspace.dependencies]
 clap = { version = "4.6", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "1.1"

@@ -2,7 +2,7 @@
 id = "arcl-t-01M6H2B4YC747EJDDWRBYHDFH5"
 parent = "arcl-t-01M6H2B4X9KF5M9GWPPJ3CJ2ZQ"
 title = "Embed the release train in train.toml"
-status = "pending"
+status = "in_progress"
 priority = "normal"
 position = 0
 blocked-by = ["arcl-t-01M6H2B4W7WS26JET50F5DXDT3"]
@@ -15,21 +15,23 @@ and the pins have drifted (fab 0.8.0, 0.7.1,
 
 ## Done when
 
-`train.toml` lists fab, arcl and mire, each
-with tier, binary, version, a download URL
+`train.toml` lists fab and arcl, each with
+tier, binary, version, a download URL
 template, platforms, the sha256 of each
 platform's archive, copied from dist's
 `.sha256` files, and setup commands: `fab
 init` for fab, `arcl init --workspace` and
-`arcl skill install` for arcl, none for mire.
-`sltk-core` parses it, and `sltk train` prints
-the pinned set. Tests reject a train with a
-missing hash or an unknown tier.
+`arcl skill install` for arcl. mire has no
+release yet, so it joins in the follow-up task
+"Add mire to the release train". `sltk-core`
+parses it, and `sltk train` prints the pinned
+set. Tests reject a train with a missing hash
+or an unknown tier.
 
 ## Not in this task
 
 Downloading anything. Running the setup
-commands.
+commands. The mire entry.
 
 ## Paths
 

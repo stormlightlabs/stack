@@ -1,0 +1,40 @@
+# The release train: one tested version of each tool. The sltk binary embeds
+# this file, so a new train needs a new sltk release.
+#
+# `url` is a template: sltk replaces {version} with the tool's version and
+# {archive} with the platform's archive name. Copy each sha256 from the
+# `.sha256` file dist publishes beside the archive. `setup` lists the commands
+# that set a repository up, each as its program and arguments.
+
+[[tool]]
+name = "fab"
+tier = "essential"
+binary = "fab"
+version = "0.8.0"
+url = "https://github.com/stormlightlabs/fabrial/releases/download/v{version}/{archive}"
+setup = [["fab", "init"]]
+
+[tool.platforms.aarch64-apple-darwin]
+archive = "fab-cli-aarch64-apple-darwin.tar.xz"
+sha256 = "bd8c707af7c6088c1afdf57ff5b9e9f1c4f4830d0dabf1432c4b5ebaced33fe0"
+
+[tool.platforms.x86_64-unknown-linux-gnu]
+archive = "fab-cli-x86_64-unknown-linux-gnu.tar.xz"
+sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
+
+[[tool]]
+name = "arcl"
+tier = "essential"
+binary = "arcl"
+version = "0.3.0"
+url = "https://github.com/stormlightlabs/arclightning/releases/download/v{version}/{archive}"
+setup = [["arcl", "init", "--workspace"], ["arcl", "skill", "install"]]
+
+[tool.platforms.aarch64-apple-darwin]
+archive = "arcl-cli-aarch64-apple-darwin.tar.xz"
+sha256 = "7cf3c94e04bac6c9dff4fd357fc8133050fe0dbbca9d4d1dab2e4ecd8c5e13c3"
+
+# arcl publishes no gnu archive: this platform takes its static musl build.
+[tool.platforms.x86_64-unknown-linux-gnu]
+archive = "arcl-cli-x86_64-unknown-linux-musl.tar.xz"
+sha256 = "80f6bc7e4ce41f7037c91330c814d94e277aed381d192960d00a130a859675e3"
