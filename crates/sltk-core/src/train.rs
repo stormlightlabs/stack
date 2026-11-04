@@ -54,6 +54,16 @@ impl Platform {
             Platform::LinuxX86_64 => "x86_64-unknown-linux-gnu",
         }
     }
+
+    /// The architecture and OS an archive name must contain to be built for
+    /// the platform. Linux matches on `linux` alone so a musl build can serve
+    /// the gnu target.
+    pub fn archive_markers(self) -> [&'static str; 2] {
+        match self {
+            Platform::AppleSilicon => ["aarch64", "apple-darwin"],
+            Platform::LinuxX86_64 => ["x86_64", "linux"],
+        }
+    }
 }
 
 impl fmt::Display for Platform {
@@ -86,6 +96,43 @@ pub enum TrainError {
     /// A URL template lacks a placeholder it needs.
     #[error("train.toml: the url of {tool} has no {placeholder}")]
     MissingPlaceholder { tool: String, placeholder: &'static str },
+    /// A URL template does not start with `https://`.
+    #[error("train.toml: the url of {tool} does not start with https://")]
+    InsecureUrl { tool: String },
+    /// A tool has an empty name.
+    #[error("train.toml: a tool has an empty name")]
+    EmptyName,
+    /// A field of a tool is empty.
+    #[error("train.toml: {tool} has an empty {field}")]
+    EmptyField { tool: String, field: String },
+    /// A field holds a path separator, `..`, or a URL delimiter, so it could
+    /// leave the directory or URL it is placed in.
+    #[error("train.toml: the {field} of {tool} contains {found:?}")]
+    BadCharacter {
+        tool: String,
+        field: String,
+        found: &'static str,
+    },
+    /// The tool name or binary is `.`.
+    #[error("train.toml: the {field} of {tool} is \".\"")]
+    DotName { tool: String, field: &'static str },
+    /// A setup command has no program.
+    #[error("train.toml: {tool} has an empty setup command")]
+    EmptySetup { tool: String },
+    /// A setup command runs a program other than the tool's binary.
+    #[error("train.toml: a setup command of {tool} runs {program}, not {binary}")]
+    ForeignSetup {
+        tool: String,
+        program: String,
+        binary: String,
+    },
+    /// An archive name lacks the architecture or OS of its platform.
+    #[error("train.toml: the archive of {tool} for {platform} is not named for {marker}")]
+    WrongArchive {
+        tool: String,
+        platform: Platform,
+        marker: &'static str,
+    },
 }
 
 /// One release archive of a tool, for one platform.
@@ -171,13 +218,25 @@ struct RawTool {
 }
 
 impl RawTool {
-    /// Checks that the URL template has both placeholders, that the tool
-    /// lists a platform, and that every listed platform has a well-formed
-    /// sha256.
+    /// Checks every field before a tool reaches an install.
     ///
-    /// `{version}` is required because dist's archive names carry no version:
-    /// without it in the URL, every version would download the same file.
+    /// The name and binary must be plain file names, since the install joins
+    /// `binary` onto a directory. The version and archive names must not leave
+    /// the URL path segment they replace. The URL must be https and have both
+    /// placeholders: `{version}` because dist's archive names carry no
+    /// version, so without it every version would download the same file.
+    /// Each setup command must run the tool's own binary. Each platform needs
+    /// a well-formed sha256 and an archive named for its architecture and OS.
     fn check(self) -> Result<Tool, TrainError> {
+        if self.name.is_empty() {
+            return Err(TrainError::EmptyName);
+        }
+        check_file_name(&self.name, "name", &self.name)?;
+        check_file_name(&self.name, "binary", &self.binary)?;
+        check_segment(&self.name, "version", &self.version)?;
+        if !self.url.starts_with("https://") {
+            return Err(TrainError::InsecureUrl { tool: self.name });
+        }
         for placeholder in ["{version}", "{archive}"] {
             if !self.url.contains(placeholder) {
                 return Err(TrainError::MissingPlaceholder { tool: self.name, placeholder });
@@ -194,7 +253,25 @@ impl RawTool {
             if sha256.len() != 64 || !sha256.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
                 return Err(TrainError::BadHash { tool: self.name, platform });
             }
+            check_segment(&self.name, &format!("archive for {platform}"), &archive.archive)?;
+            for marker in platform.archive_markers() {
+                if !archive.archive.contains(marker) {
+                    return Err(TrainError::WrongArchive { tool: self.name, platform, marker });
+                }
+            }
             platforms.insert(platform, Archive { name: archive.archive, sha256 });
+        }
+        for command in &self.setup {
+            let Some(program) = command.first() else {
+                return Err(TrainError::EmptySetup { tool: self.name });
+            };
+            if *program != self.binary {
+                return Err(TrainError::ForeignSetup {
+                    tool: self.name.clone(),
+                    program: program.clone(),
+                    binary: self.binary.clone(),
+                });
+            }
         }
         Ok(Tool {
             name: self.name,
@@ -215,6 +292,32 @@ impl RawTool {
 struct RawArchive {
     archive: String,
     sha256: Option<String>,
+}
+
+/// Checks that `value` is a plain file name: not empty, not `.`, and free of
+/// `/`, `\` and `..`.
+fn check_file_name(tool: &str, field: &'static str, value: &str) -> Result<(), TrainError> {
+    if value == "." {
+        return Err(TrainError::DotName { tool: tool.to_owned(), field });
+    }
+    check_chars(tool, field, value, &["/", "\\", ".."])
+}
+
+/// Checks that `value` can replace a placeholder in a URL path segment: not
+/// empty, and free of `/`, `?`, `#` and `..`.
+fn check_segment(tool: &str, field: &str, value: &str) -> Result<(), TrainError> {
+    check_chars(tool, field, value, &["/", "?", "#", ".."])
+}
+
+/// Checks that `value` is not empty and contains none of `banned`.
+fn check_chars(tool: &str, field: &str, value: &str, banned: &[&'static str]) -> Result<(), TrainError> {
+    if value.is_empty() {
+        return Err(TrainError::EmptyField { tool: tool.to_owned(), field: field.to_owned() });
+    }
+    match banned.iter().find(|b| value.contains(**b)) {
+        Some(found) => Err(TrainError::BadCharacter { tool: tool.to_owned(), field: field.to_owned(), found }),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -357,5 +460,158 @@ platforms = {}
         let text = one_tool("essential", Some(HASH)).replace("x86_64-unknown-linux-gnu]", "x86_64-pc-windows-msvc]");
         let err = Train::parse(&text).unwrap_err();
         assert!(matches!(err, TrainError::Parse(_)), "{err:?}");
+    }
+
+    fn expect_error(text: &str, message: &str) {
+        let err = Train::parse(text).unwrap_err();
+        assert_eq!(err.to_string(), message);
+    }
+
+    #[test]
+    fn an_empty_name_is_rejected() {
+        let text = one_tool("essential", Some(HASH)).replace("name = \"fab\"", "name = \"\"");
+        expect_error(&text, "train.toml: a tool has an empty name");
+    }
+
+    #[test]
+    fn empty_fields_are_rejected() {
+        let tool = one_tool("essential", Some(HASH));
+        for (from, to, message) in [
+            (
+                "binary = \"fab\"",
+                "binary = \"\"",
+                "train.toml: fab has an empty binary",
+            ),
+            (
+                "version = \"0.8.0\"",
+                "version = \"\"",
+                "train.toml: fab has an empty version",
+            ),
+            (
+                "archive = \"fab-cli-aarch64-apple-darwin.tar.xz\"",
+                "archive = \"\"",
+                "train.toml: fab has an empty archive for aarch64-apple-darwin",
+            ),
+        ] {
+            expect_error(&tool.replace(from, to), message);
+        }
+    }
+
+    #[test]
+    fn a_name_or_binary_that_is_not_a_plain_file_name_is_rejected() {
+        let tool = one_tool("essential", Some(HASH));
+        for (from, to, message) in [
+            (
+                "binary = \"fab\"",
+                r#"binary = "../../.bashrc""#,
+                r#"train.toml: the binary of fab contains "/""#,
+            ),
+            (
+                "binary = \"fab\"",
+                r#"binary = "/etc/passwd""#,
+                r#"train.toml: the binary of fab contains "/""#,
+            ),
+            (
+                "binary = \"fab\"",
+                r#"binary = 'fab\..'"#,
+                r#"train.toml: the binary of fab contains "\\""#,
+            ),
+            (
+                "binary = \"fab\"",
+                r#"binary = "..""#,
+                r#"train.toml: the binary of fab contains "..""#,
+            ),
+            (
+                "binary = \"fab\"",
+                r#"binary = ".""#,
+                r#"train.toml: the binary of fab is ".""#,
+            ),
+            (
+                "name = \"fab\"",
+                r#"name = "a/b""#,
+                r#"train.toml: the name of a/b contains "/""#,
+            ),
+            (
+                "name = \"fab\"",
+                r#"name = "..""#,
+                r#"train.toml: the name of .. contains "..""#,
+            ),
+            ("name = \"fab\"", r#"name = ".""#, r#"train.toml: the name of . is ".""#),
+        ] {
+            expect_error(&tool.replace(from, to), message);
+        }
+    }
+
+    #[test]
+    fn an_empty_setup_command_is_rejected() {
+        let text = one_tool("essential", Some(HASH)).replace("url =", "setup = [[]]\nurl =");
+        expect_error(&text, "train.toml: fab has an empty setup command");
+    }
+
+    #[test]
+    fn a_setup_command_for_another_program_is_rejected() {
+        let text = one_tool("essential", Some(HASH)).replace(
+            "url =",
+            "setup = [[\"fab\", \"init\"], [\"sh\", \"-c\", \"true\"]]\nurl =",
+        );
+        expect_error(&text, "train.toml: a setup command of fab runs sh, not fab");
+    }
+
+    #[test]
+    fn a_darwin_archive_under_the_linux_key_is_rejected() {
+        let text = one_tool("essential", Some(HASH)).replace(
+            "fab-cli-x86_64-unknown-linux-gnu.tar.xz",
+            "fab-cli-aarch64-apple-darwin.tar.xz",
+        );
+        expect_error(
+            &text,
+            "train.toml: the archive of fab for x86_64-unknown-linux-gnu is not named for x86_64",
+        );
+    }
+
+    #[test]
+    fn a_linux_archive_under_the_darwin_key_is_rejected() {
+        let text = one_tool("essential", Some(HASH)).replace(
+            "fab-cli-aarch64-apple-darwin.tar.xz",
+            "fab-cli-aarch64-unknown-linux-gnu.tar.xz",
+        );
+        expect_error(
+            &text,
+            "train.toml: the archive of fab for aarch64-apple-darwin is not named for apple-darwin",
+        );
+    }
+
+    #[test]
+    fn a_musl_archive_serves_the_linux_key() {
+        let text = one_tool("essential", Some(HASH)).replace(
+            "fab-cli-x86_64-unknown-linux-gnu.tar.xz",
+            "fab-cli-x86_64-unknown-linux-musl.tar.xz",
+        );
+        Train::parse(&text).unwrap();
+    }
+
+    #[test]
+    fn a_url_without_https_is_rejected() {
+        let text = one_tool("essential", Some(HASH)).replace("https://", "http://");
+        expect_error(&text, "train.toml: the url of fab does not start with https://");
+    }
+
+    #[test]
+    fn a_version_or_archive_that_leaves_its_url_segment_is_rejected() {
+        let tool = one_tool("essential", Some(HASH));
+        let darwin = "fab-cli-aarch64-apple-darwin.tar.xz";
+        for (field, found, from, to) in [
+            ("version", "/", "0.8.0", "0.8.0/x".to_owned()),
+            ("version", "?", "0.8.0", "0.8.0?x".to_owned()),
+            ("version", "#", "0.8.0", "0.8.0#x".to_owned()),
+            ("version", "..", "0.8.0", "0.8..0".to_owned()),
+            ("archive for aarch64-apple-darwin", "/", darwin, format!("x/{darwin}")),
+            ("archive for aarch64-apple-darwin", "?", darwin, format!("{darwin}?x")),
+            ("archive for aarch64-apple-darwin", "#", darwin, format!("{darwin}#x")),
+            ("archive for aarch64-apple-darwin", "..", darwin, format!("..{darwin}")),
+        ] {
+            let text = tool.replace(&format!("\"{from}\""), &format!("\"{to}\""));
+            expect_error(&text, &format!("train.toml: the {field} of fab contains {found:?}"));
+        }
     }
 }

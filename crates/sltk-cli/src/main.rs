@@ -75,7 +75,7 @@ version = "1.2.3"
 url = "https://example.test/v{version}/{archive}"
 
 [tool.platforms.x86_64-unknown-linux-gnu]
-archive = "alpha.tar.xz"
+archive = "alpha-x86_64-unknown-linux-gnu.tar.xz"
 sha256 = "bd8c707af7c6088c1afdf57ff5b9e9f1c4f4830d0dabf1432c4b5ebaced33fe0"
 
 [[tool]]
@@ -86,7 +86,7 @@ version = "0.1.0"
 url = "https://example.test/v{version}/{archive}"
 
 [tool.platforms.aarch64-apple-darwin]
-archive = "beta.tar.xz"
+archive = "beta-aarch64-apple-darwin.tar.xz"
 sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
 "#;
 
