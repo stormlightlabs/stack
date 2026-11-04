@@ -1,7 +1,7 @@
 //! The release train: the version of each tool an `sltk` release pins, read
 //! from the `train.toml` the binary embeds.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::Deserialize;
@@ -71,9 +71,21 @@ pub enum TrainError {
     /// A platform a tool lists has no sha256 for its archive.
     #[error("train.toml: {tool} has no sha256 for {platform}")]
     MissingHash { tool: String, platform: Platform },
-    /// A sha256 is not 64 hexadecimal digits.
-    #[error("train.toml: the sha256 of {tool} for {platform} is not 64 hexadecimal digits")]
+    /// A sha256 is not 64 lowercase hexadecimal digits.
+    #[error("train.toml: the sha256 of {tool} for {platform} is not 64 lowercase hexadecimal digits")]
     BadHash { tool: String, platform: Platform },
+    /// The train lists no tools.
+    #[error("train.toml: the train lists no tools")]
+    NoTools,
+    /// A tool lists no platforms.
+    #[error("train.toml: {tool} lists no platforms")]
+    NoPlatforms { tool: String },
+    /// Two tools share a name.
+    #[error("train.toml: {tool} is listed more than once")]
+    RepeatedTool { tool: String },
+    /// A URL template lacks a placeholder it needs.
+    #[error("train.toml: the url of {tool} has no {placeholder}")]
+    MissingPlaceholder { tool: String, placeholder: &'static str },
 }
 
 /// One release archive of a tool, for one platform.
@@ -117,10 +129,21 @@ impl Train {
         Train::parse(EMBEDDED)
     }
 
-    /// Reads a train from the text of a `train.toml`.
+    /// Reads a train from the text of a `train.toml`. A train must list at
+    /// least one tool, and no tool name twice.
     pub fn parse(text: &str) -> Result<Train, TrainError> {
         let raw: RawTrain = toml::from_str(text)?;
-        let tools = raw.tool.into_iter().map(RawTool::check).collect::<Result<_, _>>()?;
+        if raw.tool.is_empty() {
+            return Err(TrainError::NoTools);
+        }
+        let mut names = BTreeSet::new();
+        let mut tools = Vec::with_capacity(raw.tool.len());
+        for raw_tool in raw.tool {
+            if !names.insert(raw_tool.name.clone()) {
+                return Err(TrainError::RepeatedTool { tool: raw_tool.name });
+            }
+            tools.push(raw_tool.check()?);
+        }
         Ok(Train { tools })
     }
 }
@@ -148,8 +171,21 @@ struct RawTool {
 }
 
 impl RawTool {
-    /// Checks that every listed platform has a well-formed sha256.
+    /// Checks that the URL template has both placeholders, that the tool
+    /// lists a platform, and that every listed platform has a well-formed
+    /// sha256.
+    ///
+    /// `{version}` is required because dist's archive names carry no version:
+    /// without it in the URL, every version would download the same file.
     fn check(self) -> Result<Tool, TrainError> {
+        for placeholder in ["{version}", "{archive}"] {
+            if !self.url.contains(placeholder) {
+                return Err(TrainError::MissingPlaceholder { tool: self.name, placeholder });
+            }
+        }
+        if self.platforms.is_empty() {
+            return Err(TrainError::NoPlatforms { tool: self.name });
+        }
         let mut platforms = BTreeMap::new();
         for (platform, archive) in self.platforms {
             let Some(sha256) = archive.sha256 else {
@@ -249,6 +285,64 @@ archive = "fab-cli-x86_64-unknown-linux-gnu.tar.xz"
     fn a_malformed_hash_is_rejected() {
         let err = Train::parse(&one_tool("essential", Some("abc123"))).unwrap_err();
         assert!(matches!(err, TrainError::BadHash { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_hash_with_a_non_hex_digit_is_rejected() {
+        let hash = format!("{}g", &HASH[..63]);
+        let err = Train::parse(&one_tool("essential", Some(&hash))).unwrap_err();
+        assert!(matches!(err, TrainError::BadHash { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn an_uppercase_hash_is_rejected() {
+        let err = Train::parse(&one_tool("essential", Some(&HASH.to_uppercase()))).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "train.toml: the sha256 of fab for x86_64-unknown-linux-gnu is not 64 lowercase hexadecimal digits"
+        );
+    }
+
+    #[test]
+    fn an_empty_train_is_rejected() {
+        let err = Train::parse("").unwrap_err();
+        assert!(matches!(err, TrainError::NoTools), "{err:?}");
+    }
+
+    #[test]
+    fn a_tool_with_no_platforms_is_rejected() {
+        let text = r#"
+[[tool]]
+name = "fab"
+tier = "essential"
+binary = "fab"
+version = "0.8.0"
+url = "https://example.test/v{version}/{archive}"
+platforms = {}
+"#;
+        let err = Train::parse(text).unwrap_err();
+        assert_eq!(err.to_string(), "train.toml: fab lists no platforms");
+    }
+
+    #[test]
+    fn a_repeated_tool_is_rejected() {
+        let tool = one_tool("essential", Some(HASH));
+        let err = Train::parse(&format!("{tool}\n{tool}")).unwrap_err();
+        assert_eq!(err.to_string(), "train.toml: fab is listed more than once");
+    }
+
+    #[test]
+    fn a_url_without_archive_is_rejected() {
+        let text = one_tool("essential", Some(HASH)).replace("/{archive}", "/fab.tar.xz");
+        let err = Train::parse(&text).unwrap_err();
+        assert_eq!(err.to_string(), "train.toml: the url of fab has no {archive}");
+    }
+
+    #[test]
+    fn a_url_without_version_is_rejected() {
+        let text = one_tool("essential", Some(HASH)).replace("/v{version}", "/latest");
+        let err = Train::parse(&text).unwrap_err();
+        assert_eq!(err.to_string(), "train.toml: the url of fab has no {version}");
     }
 
     #[test]

@@ -65,9 +65,40 @@ mod tests {
         assert_eq!(err.to_string(), format!("sltk {}\n", env!("CARGO_PKG_VERSION")));
     }
 
+    /// A two-tool train, so train bumps leave this test alone.
+    const FIXTURE: &str = r#"
+[[tool]]
+name = "alpha"
+tier = "essential"
+binary = "alpha"
+version = "1.2.3"
+url = "https://example.test/v{version}/{archive}"
+
+[tool.platforms.x86_64-unknown-linux-gnu]
+archive = "alpha.tar.xz"
+sha256 = "bd8c707af7c6088c1afdf57ff5b9e9f1c4f4830d0dabf1432c4b5ebaced33fe0"
+
+[[tool]]
+name = "beta"
+tier = "optional"
+binary = "beta"
+version = "0.1.0"
+url = "https://example.test/v{version}/{archive}"
+
+[tool.platforms.aarch64-apple-darwin]
+archive = "beta.tar.xz"
+sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
+"#;
+
     #[test]
     fn train_prints_one_line_per_tool() {
+        let train = Train::parse(FIXTURE).unwrap();
+        assert_eq!(pinned_set(&train), "alpha 1.2.3 essential\nbeta 0.1.0 optional\n");
+    }
+
+    #[test]
+    fn the_embedded_train_prints() {
         let train = Train::embedded().unwrap();
-        assert_eq!(pinned_set(&train), "fab 0.8.0 essential\narcl 0.3.0 essential\n");
+        assert_eq!(pinned_set(&train).lines().count(), train.tools.len());
     }
 }
