@@ -2,10 +2,11 @@
 id = "arcl-t-01M6H2B4YC747EJDDWRBYHDFH5"
 parent = "arcl-t-01M6H2B4X9KF5M9GWPPJ3CJ2ZQ"
 title = "Embed the release train in train.toml"
-status = "in_progress"
+status = "completed"
 priority = "normal"
 position = 0
 blocked-by = ["arcl-t-01M6H2B4W7WS26JET50F5DXDT3"]
+evidence = "Done in #7 at 4d3f325: train.toml pins fab 0.8.0 and arcl 0.3.0 for both platforms with hashes from dist's .sha256 files; sltk-core parses and validates it; sltk train prints the pinned set; mire follows in arcl-t-01M6J62CDRJY6YQR5NEZG913RR."
 +++
 
 Each repository pins tool versions by hand,
