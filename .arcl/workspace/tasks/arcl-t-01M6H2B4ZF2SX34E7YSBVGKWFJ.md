@@ -18,9 +18,10 @@ downloads archives and checks them itself.
 tool's archive, checks it against the train's
 sha256, and unpacks the binary into
 `~/.cargo/bin` (or `$CARGO_HOME/bin`).
-`--with mire` adds mire. An integration test
-against a local HTTP fixture installs on a good
-hash and writes nothing on a bad one.
+`--with mire` adds mire from a fixture train
+that lists it. An integration test against a
+local HTTP fixture installs on a good hash and
+writes nothing on a bad one.
 
 ## Not in this task
 
