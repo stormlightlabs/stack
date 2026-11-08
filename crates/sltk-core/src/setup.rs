@@ -19,6 +19,14 @@ use crate::train::{Platform, Tier, Train};
 pub const RELEASE_HASH_URL: &str =
     "https://github.com/stormlightlabs/stack/releases/download/v{version}/sltk-cli-{target}.tar.xz.sha256";
 
+/// Where `fab init` writes fab's settings, relative to the repository root.
+pub const FAB_SETTINGS: &str = ".github/fabrial.toml";
+
+/// Why `init` refuses a repository that something other than its own earlier
+/// run set up, and where that work is planned.
+const ADOPT: &str = "sltk cannot adopt a repository set up by hand yet \
+     (planned in the stack task \"Adopt repositories set up by hand\")";
+
 /// Why a download of a `.sha256` file can fail even when the network works.
 const UNPUBLISHED: &str =
     "sltk init pins a published sltk release, and stormlightlabs/stack publishes none before 0.1.0";
@@ -51,10 +59,15 @@ impl Flag {
         }
     }
 
-    /// Checks a value for this flag. Every value is one line with no control
-    /// characters and no space at either end, since fab writes each as one
-    /// line of `.github/fabrial.toml`. An owner has no spaces, and a trailer
-    /// reads `Name <email>`.
+    /// Checks a value for this flag, so a value `fab init` would refuse fails
+    /// before any download or answer is spent on it.
+    ///
+    /// fab's own rules come from fab 0.8.0's `Settings::validate` and
+    /// `is_login` in `crates/fab-core/src/settings.rs`: no value is empty or
+    /// holds a quote, a backslash or a line break, and the owner is a GitHub
+    /// login without the `@`. sltk adds that a value holds no control
+    /// character and no space at either end, and that a trailer reads
+    /// `Name <email>`, the form a Co-authored-by line takes.
     pub fn check(self, value: &str) -> Result<(), String> {
         if value.is_empty() {
             return Err("is empty".to_owned());
@@ -62,11 +75,18 @@ impl Flag {
         if value.chars().any(char::is_control) {
             return Err("holds a control character or line break".to_owned());
         }
+        if value.contains(['"', '\\']) {
+            return Err("holds a quote or a backslash, which fab cannot write".to_owned());
+        }
         if value.trim() != value {
             return Err("starts or ends with a space".to_owned());
         }
         match self {
-            Flag::Owner if value.contains(char::is_whitespace) => Err("holds a space".to_owned()),
+            Flag::Owner if value.starts_with('@') => Err("is a login without the @".to_owned()),
+            Flag::Owner if !is_login(value) => Err(
+                "is not a GitHub login: letters, digits and single hyphens, not at either end, up to 39 characters"
+                    .to_owned(),
+            ),
             Flag::Trailer if !is_trailer(value) => Err("is not Name <email>".to_owned()),
             _ => Ok(()),
         }
@@ -78,11 +98,12 @@ impl Flag {
 pub enum SetupError {
     /// The repository already has a pin. Adopting a set-up repository is not
     /// built yet, and `init` never overwrites the pin.
-    #[error(
-        "sltk: {} already exists; sltk init sets up a new repository and cannot adopt one yet",
-        path.display()
-    )]
+    #[error("sltk: {} already exists; {ADOPT}", path.display())]
     PinExists { path: PathBuf },
+    /// The repository has fab's settings file, and it is not the one an
+    /// earlier `sltk init` with the same flags wrote.
+    #[error("sltk: {} {reason}; {ADOPT}", path.display())]
+    FabInstalled { path: PathBuf, reason: String },
     /// A fab setting is not valid.
     #[error("sltk: {flag} {reason}")]
     BadFlag { flag: &'static str, reason: String },
@@ -97,15 +118,27 @@ pub enum SetupError {
     #[error("sltk: {0}")]
     Pin(#[from] PinError),
     /// A setup command could not be started.
-    #[error("sltk: could not run {command} in {}: {source}", dir.display())]
+    #[error("sltk: could not run {command} in {}: {source}. {progress}", dir.display())]
     Spawn {
         command: String,
         dir: PathBuf,
         source: std::io::Error,
+        progress: Progress,
     },
     /// A setup command exited with a failure.
-    #[error("sltk: {command} failed with {status}; sltk did not write the pin")]
-    Failed { command: String, status: ExitStatus },
+    #[error("sltk: {command} failed with {status}. {progress}")]
+    Failed {
+        command: String,
+        status: ExitStatus,
+        progress: Progress,
+    },
+}
+
+/// Gives the sha256 of this `sltk` release's archive for a platform.
+/// [`ReleaseHashes`] is the real one; tests supply fixed hashes.
+pub trait HashSource {
+    /// The digest for `platform` in lowercase hexadecimal, or what went wrong.
+    fn sha256(&self, platform: Platform) -> Result<String, String>;
 }
 
 /// The three settings `fab init` requires, each checked by [`Flag::check`].
@@ -155,11 +188,28 @@ pub struct Init<'a> {
     pub path: Option<&'a OsStr>,
 }
 
-/// Gives the sha256 of this `sltk` release's archive for a platform.
-/// [`ReleaseHashes`] is the real one; tests supply fixed hashes.
-pub trait HashSource {
-    /// The digest for `platform` in lowercase hexadecimal, or what went wrong.
-    fn sha256(&self, platform: Platform) -> Result<String, String>;
+/// Where a failed `sltk init` stopped: the setup commands it ran and the
+/// ones it did not reach. A rerun with the same flags finishes the setup,
+/// since it skips a `fab init` that already ran and the arcl commands are
+/// safe to run again.
+#[derive(Debug)]
+pub struct Progress {
+    /// The commands that succeeded, as command lines.
+    pub ran: Vec<String>,
+    /// The commands after the failed one, as command lines.
+    pub not_run: Vec<String>,
+}
+
+impl std::fmt::Display for Progress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let list = |lines: &[String]| if lines.is_empty() { "none".to_owned() } else { lines.join("; ") };
+        write!(
+            f,
+            "Ran: {}. Not run: {}. sltk did not write the pin; rerun sltk init with the same flags to finish",
+            list(&self.ran),
+            list(&self.not_run)
+        )
+    }
 }
 
 /// Reads each hash from the `.sha256` file published beside the archive, at
@@ -199,7 +249,7 @@ pub fn commands(train: &Train, settings: &FabSettings, with: &[String]) -> Vec<V
         }
         for command in &tool.setup {
             let mut command = command.clone();
-            if tool.name == "fab" && command[1..] == ["init"] {
+            if tool.name == "fab" && is_fab_init(&command) {
                 for flag in Flag::ALL {
                     command.extend([flag.name().to_owned(), settings.get(flag).to_owned()]);
                 }
@@ -210,15 +260,21 @@ pub fn commands(train: &Train, settings: &FabSettings, with: &[String]) -> Vec<V
     commands
 }
 
-/// Runs `sltk init`: reads this release's archive hashes and checks the pin,
-/// runs each of [`commands`] in the repository root, stopping at the first
-/// failure, and then writes the pin. Writes the command lines and the pin's
-/// path to `output`. Refuses a repository that already has a pin.
+/// Runs `sltk init`: checks the repository, reads this release's archive
+/// hashes and checks the pin, runs each of [`commands`] in the repository
+/// root, stopping at the first failure, and then writes the pin. Writes the
+/// command lines and the pin's path to `output`.
+///
+/// Refuses a repository that already has a pin, or fab's settings file with
+/// other settings than `init.settings`. A settings file with the same ones is
+/// what an earlier run that failed after `fab init` left, so `init` skips
+/// `fab init`, which refuses to run twice, and runs the rest.
 pub fn init(train: &Train, version: &str, init: Init, output: &mut dyn Write) -> Result<Pin, SetupError> {
     let path = init.root.join(pin::PATH);
     if path.exists() {
         return Err(SetupError::PinExists { path });
     }
+    let fab_done = fab_installed(init.root, init.settings)?;
     let mut sha256 = std::collections::BTreeMap::new();
     for platform in pin::TARGETS {
         let hash = init.hashes.sha256(platform).map_err(|message| SetupError::Hash {
@@ -231,10 +287,18 @@ pub fn init(train: &Train, version: &str, init: Init, output: &mut dyn Write) ->
     let pin = Pin { version: version.to_owned(), sha256, optional: init.with.to_vec() };
     // Checks the pin before any command changes the repository.
     pin.render(train)?;
-    for command in commands(train, init.settings, init.with) {
-        let line = command_line(&command);
-        // The commands still run when stdout is closed.
+    let commands = commands(train, init.settings, init.with);
+    let lines: Vec<String> = commands.iter().map(|command| command_line(command)).collect();
+    let mut ran = Vec::new();
+    for (i, command) in commands.iter().enumerate() {
+        let line = &lines[i];
+        // The commands still run when stdout is closed, so writes to it may fail.
+        if fab_done && is_fab_init(command) {
+            let _ = writeln!(output, "skipping fab init: {FAB_SETTINGS} already holds these settings");
+            continue;
+        }
         let _ = writeln!(output, "running {line}");
+        let progress = || Progress { ran: ran.clone(), not_run: lines[i + 1..].to_vec() };
         let mut process = Command::new(&command[0]);
         process.args(&command[1..]).current_dir(init.root);
         if let Some(path) = init.path {
@@ -244,14 +308,58 @@ pub fn init(train: &Train, version: &str, init: Init, output: &mut dyn Write) ->
             command: line.clone(),
             dir: init.root.to_owned(),
             source,
+            progress: progress(),
         })?;
         if !status.success() {
-            return Err(SetupError::Failed { command: line, status });
+            return Err(SetupError::Failed { command: line.clone(), status, progress: progress() });
         }
+        ran.push(line.clone());
     }
     pin.write(init.root, train)?;
     let _ = writeln!(output, "wrote {}", pin::PATH);
     Ok(pin)
+}
+
+/// Whether `command` is the train's `fab init`.
+fn is_fab_init(command: &[String]) -> bool {
+    command.len() >= 2 && command[0] == "fab" && command[1] == "init"
+}
+
+/// Whether fab is already installed in `root` with `settings`: `false` when
+/// there is no [`FAB_SETTINGS`], `true` when it holds the same owner, trailer
+/// and gates, and an error otherwise. Reads the file as fab does, as TOML
+/// with those three string keys.
+fn fab_installed(root: &Path, settings: &FabSettings) -> Result<bool, SetupError> {
+    /// The keys of fab's settings file that `fab init` takes as flags.
+    #[derive(serde::Deserialize)]
+    struct Installed {
+        owner: String,
+        trailer: String,
+        gates: String,
+    }
+    let path = root.join(FAB_SETTINGS);
+    let refuse = |reason: String| SetupError::FabInstalled { path: path.clone(), reason };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(refuse(format!("could not be read: {err}"))),
+    };
+    let installed: Installed = toml::from_str(&text)
+        .map_err(|err| refuse(format!("could not be read as fab's settings: {}", err.message())))?;
+    let differ: Vec<&str> = [
+        (Flag::Owner, installed.owner),
+        (Flag::Trailer, installed.trailer),
+        (Flag::Gates, installed.gates),
+    ]
+    .into_iter()
+    .filter(|(flag, value)| settings.get(*flag) != value)
+    .map(|(flag, _)| flag.name())
+    .collect();
+    if differ.is_empty() {
+        Ok(true)
+    } else {
+        Err(refuse(format!("holds other values for {}", differ.join(", "))))
+    }
 }
 
 /// The digest at the start of a `.sha256` file, lowercased, when it is 64
@@ -259,6 +367,18 @@ pub fn init(train: &Train, version: &str, init: Init, output: &mut dyn Write) ->
 fn parse_digest(text: &str) -> Option<String> {
     let digest = text.split_whitespace().next()?.to_ascii_lowercase();
     (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())).then_some(digest)
+}
+
+/// Whether `owner` is a GitHub login: ASCII letters, digits and single
+/// hyphens, not starting or ending with a hyphen, up to 39 characters. A copy
+/// of `is_login` in fab 0.8.0's `crates/fab-core/src/settings.rs`.
+fn is_login(owner: &str) -> bool {
+    !owner.is_empty()
+        && owner.len() <= 39
+        && owner.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !owner.starts_with('-')
+        && !owner.ends_with('-')
+        && !owner.contains("--")
 }
 
 /// Whether `value` reads `Name <email>`: a name, a space, and an address with
@@ -380,8 +500,36 @@ mod tests {
             assert!(flag.check("a\nb").is_err());
             assert_eq!(flag.check(" a"), Err("starts or ends with a space".to_owned()));
         }
-        assert_eq!(Flag::Owner.check("a b"), Err("holds a space".to_owned()));
         assert_eq!(Flag::Gates.check("cargo test --locked"), Ok(()));
+    }
+
+    #[test]
+    fn no_flag_takes_a_quote_or_a_backslash() {
+        let reason = Err("holds a quote or a backslash, which fab cannot write".to_owned());
+        assert_eq!(Flag::Gates.check(r#"sh -c "just check""#), reason);
+        assert_eq!(Flag::Gates.check(r"just check\"), reason);
+        assert_eq!(Flag::Trailer.check(r#"Ada "A" <ada@example.com>"#), reason);
+        assert_eq!(Flag::Owner.check(r"oc\to"), reason);
+    }
+
+    #[test]
+    fn an_owner_must_be_a_github_login() {
+        let long = "x".repeat(39);
+        for good in ["desertthunder", "a", "a-b-c", "A1", long.as_str()] {
+            assert_eq!(Flag::Owner.check(good), Ok(()), "{good}");
+        }
+        let longer = "x".repeat(40);
+        for bad in ["a b", "-a", "a-", "a--b", "a_b", "a.b", "ä", longer.as_str()] {
+            assert_eq!(
+                Flag::Owner.check(bad),
+                Err(
+                    "is not a GitHub login: letters, digits and single hyphens, not at either end, up to 39 characters"
+                        .to_owned()
+                ),
+                "{bad}"
+            );
+        }
+        assert_eq!(Flag::Owner.check("@octo"), Err("is a login without the @".to_owned()));
     }
 
     #[test]

@@ -181,7 +181,10 @@ mod tests {
             &mut output,
         )
         .unwrap_err();
-        assert_eq!(err, "sltk: --owner holds a space\n");
+        assert_eq!(
+            err,
+            "sltk: --owner is not a GitHub login: letters, digits and single hyphens, not at either end, up to 39 characters\n"
+        );
         assert!(output.is_empty());
     }
 

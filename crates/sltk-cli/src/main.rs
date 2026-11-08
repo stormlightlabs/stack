@@ -88,12 +88,16 @@ enum Command {
     /// root: --dir, or the top of the git repository holding the current
     /// directory. On a terminal it asks for each of the three settings left
     /// out; off a terminal a missing one is an error. It stops at the first
-    /// command that fails. When every command succeeds it writes
-    /// .github/sltk.toml, pinning this sltk release and the sha256 of its
-    /// archives, read from the release's .sha256 files. It reads those first,
-    /// so it changes nothing when this sltk has no published release. It
-    /// refuses a repository that already has .github/sltk.toml. Exits 0 when
-    /// set up, 1 otherwise.
+    /// command that fails and names the commands that ran and the ones that
+    /// did not; rerunning with the same flags finishes the setup. When every
+    /// command succeeds it writes .github/sltk.toml, pinning this sltk
+    /// release and the sha256 of its archives, read from the release's
+    /// .sha256 files. It reads those first, so it changes nothing when this
+    /// sltk has no published release. It refuses a repository that already
+    /// has .github/sltk.toml, or a .github/fabrial.toml with other settings
+    /// than the flags give. A .github/fabrial.toml with the same settings is
+    /// left from an earlier run, so it skips `fab init`. Exits 0 when set up,
+    /// 1 otherwise.
     Init {
         /// GitHub login of the person who approves pull requests.
         #[arg(long)]
