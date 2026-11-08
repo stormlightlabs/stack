@@ -113,6 +113,23 @@ it.
   rewrite the hook and `sltk check` compare the two. That is the double pin
   the hand-copied hooks carry. The hook stays the same file in every
   repository.
+- The hook downloads the `sltk-cli-<target>.tar.xz` archive and checks it
+  against a sha256 pinned in `.github/sltk.toml`, beside `version`. It never
+  runs dist's installer script. `sltk init` and `sltk update` write one exact
+  line per supported platform, `sha256-aarch64-apple-darwin = "<hex>"` and
+  `sha256-x86_64-unknown-linux-gnu = "<hex>"`, copied from the `.sha256` files
+  on the `sltk` release they pin. The hook maps `uname -sm` to its target,
+  reads that line, and fails when the line is missing or the hash differs.
+  This is the train's rule applied to `sltk` itself: an archive uploaded again
+  after the pin fails the check, and a new version and its hashes are one diff
+  in one file.
+- The other ways to check were weaker or cost more. The `.sha256` file beside
+  the archive comes from the same release, so it catches a broken download
+  but not a replaced one. dist's installer script checks the archive against
+  a hash written into the script, but nothing checks the script. GitHub
+  artifact attestations need `gh` in the session, dist's experimental
+  `github-attestations` setting, and a public repository or GitHub
+  Enterprise.
 - `sltk init` adopts a repository that is already set up. It keeps the
   settings in `.github/fabrial.toml` and runs `fab update`, replaces a copied
   `session-start.sh`, and rewrites the Tasks section in place. It runs
@@ -180,6 +197,20 @@ it.
 - The assets of arcl's v0.3.0 release: a `.sha256` file beside each archive,
   none beside `arcl-cli-installer.sh`, and a `sha256.sum` that lists no
   installer.
+- The GitHub releases API for fab's v0.8.0 and arcl's v0.3.0, checked
+  2026-11-08: each archive has a `.sha256` file beside it; neither installer
+  script has one. fab's archive hashes match the `.sha256` files and
+  `train.toml`.
+- cargo-dist 0.32.0's `installer.sh.j2`: the script carries each archive's
+  sha256 and checks it with `sha256sum`, skipping the check when `sha256sum`
+  is missing.
+- cargo-dist 0.32.0's config reference and attestations guide:
+  `github-attestations` is experimental and off by default, it adds an
+  `actions/attest` step to `release.yml`, verification goes through
+  `gh attestation verify`, and it supports public repositories and
+  organization repositories on GitHub Enterprise.
+- The GitHub API for `stormlightlabs/stack`, checked 2026-11-08: the
+  repository is private and has no releases yet.
 - `.github/fabrial.toml` in each repository: the fab version each pins.
 - The prototype session hook in PR #4: it read arcl 0.3.0 from a test
   `sltk.toml` with the shell one-liner and installed it in a Claude cloud

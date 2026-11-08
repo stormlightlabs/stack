@@ -2,7 +2,7 @@
 id = "arcl-t-01M6H4C5Z4PQ6WKD582Y05H1KJ"
 parent = "arcl-t-01M6H2B51T9ZV42EXGEQ7GQV5X"
 title = "Decide how the session hook verifies the sltk download"
-status = "pending"
+status = "in_progress"
 priority = "normal"
 position = 0
 +++

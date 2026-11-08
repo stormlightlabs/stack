@@ -14,8 +14,10 @@ Repositories need one command to follow it.
 ## Done when
 
 `sltk update` writes this binary's train
-version into the pin, runs `fab update`, then
-the glue writers, and shows the diff first as
+version into the pin, with the sha256 of each
+`sltk` archive copied from the `.sha256` files
+on that release, runs `fab update`, then the
+glue writers, and shows the diff first as
 adoption does. It refuses to move to an older
 train. In a test, after `sltk update` and
 `sltk install --yes`, `sltk check` passes.
