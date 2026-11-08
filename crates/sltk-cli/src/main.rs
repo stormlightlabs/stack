@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use sltk_core::install::{self, HttpFetch, InstallError};
 use sltk_core::platform::{Host, Plan};
-use sltk_core::train::Train;
+use sltk_core::train::{Tier, Train};
 
 /// The exit code of a failure that wrote nothing to the bin directory.
 const FAILED: u8 = 1;
@@ -32,7 +32,7 @@ const DECLINED_LINE: &str = "sltk: nothing was installed\n";
 enum Command {
     /// Print the version and tier of each tool this release pins.
     Train,
-    /// Install the pinned fab and arcl, and any tool named with --with.
+    /// Install the pinned fab and arcl, and any optional tool chosen.
     ///
     /// Downloads each tool's release archive, checks it against the sha256
     /// the train pins, and puts the binary in $CARGO_HOME/bin, or
@@ -41,19 +41,23 @@ enum Command {
     /// proxy in the first of ALL_PROXY, HTTPS_PROXY and HTTP_PROXY that is
     /// set, upper or lower case, except for hosts in NO_PROXY.
     ///
-    /// It prints what it will install first. On a terminal without --yes it
-    /// then asks before installing, and exits 3 if the answer is no. Off a
-    /// terminal, where stdin or stdout is not one, it installs without
-    /// asking. Exits 0 once every tool is installed. Exits 1 when it wrote
-    /// nothing: a tool has no archive for this machine, a --with name is
-    /// wrong, or a download, hash check or write fails. Exits 4 when it
-    /// replaced some tools and then failed, leaving the rest as they were;
-    /// the error names the tools it replaced.
+    /// On a terminal without --yes or --with it lists the optional tools,
+    /// unticked, and asks which to add by number or name; Enter adds none.
+    /// It skips that question when the train lists no optional tool. It
+    /// prints what it will install, and on a terminal without --yes it then
+    /// asks before installing, and exits 3 if the answer is no. Off a
+    /// terminal, where stdin or stdout is not one, it asks nothing and
+    /// installs fab, arcl and the --with tools. Exits 0 once every tool is
+    /// installed. Exits 1 when it wrote nothing: a tool has no archive for
+    /// this machine, a --with name is wrong, or a download, hash check or
+    /// write fails. Exits 4 when it replaced some tools and then failed,
+    /// leaving the rest as they were; the error names the tools it replaced.
     Install {
         /// Install without asking. Off a terminal sltk never asks.
         #[arg(long)]
         yes: bool,
-        /// Also install this optional tool. Repeat for more than one.
+        /// Also install this optional tool, and ask for no others. Repeat
+        /// for more than one.
         #[arg(long = "with", value_name = "TOOL")]
         with: Vec<String>,
     },
@@ -126,6 +130,30 @@ fn on_terminal() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
 }
 
+/// The optional tools to install: the `--with` names, or, on a terminal
+/// without `--yes` or `--with`, the ones the person picks from the train's
+/// optional tools. Asks nothing when the train lists no optional tool.
+fn optional_tools(
+    train: &Train, choices: &Choices, input: &mut impl BufRead, output: &mut impl Write,
+) -> io::Result<Vec<String>> {
+    if choices.yes || !choices.terminal || !choices.with.is_empty() {
+        return Ok(choices.with.to_vec());
+    }
+    let names = |tier| -> Vec<&str> {
+        train
+            .tools
+            .iter()
+            .filter(|tool| tool.tier == tier)
+            .map(|tool| tool.name.as_str())
+            .collect()
+    };
+    let optional = names(Tier::Optional);
+    if optional.is_empty() {
+        return Ok(Vec::new());
+    }
+    prompt::pick(input, output, &names(Tier::Essential), &optional)
+}
+
 /// Whether to install the plan: yes with `--yes` or off a `terminal`, else the
 /// answer to [`QUESTION`], read from `input`.
 fn should_install(yes: bool, terminal: bool, input: &mut impl BufRead, output: &mut impl Write) -> io::Result<bool> {
@@ -135,14 +163,16 @@ fn should_install(yes: bool, terminal: bool, input: &mut impl BufRead, output: &
     prompt::confirm(input, output, QUESTION)
 }
 
-/// Runs `sltk install`: writes the plan to `output`, then installs it when
-/// [`should_install`] says to, reading any answer from `input`. Returns the
-/// exit code, or the exit code and the error to print.
+/// Runs `sltk install`: settles the tools with [`optional_tools`], writes the
+/// plan to `output`, then installs it when [`should_install`] says to,
+/// reading any answer from `input`. Returns the exit code, or the exit code
+/// and the error to print.
 fn run_install(
     train: &Train, choices: Choices, input: &mut impl BufRead, output: &mut impl Write,
 ) -> Result<u8, (u8, String)> {
     let io_failed = |err: io::Error| (FAILED, format!("sltk: could not ask before installing: {err}\n"));
-    let with: Vec<&str> = choices.with.iter().map(String::as_str).collect();
+    let with = optional_tools(train, &choices, input, output).map_err(io_failed)?;
+    let with: Vec<&str> = with.iter().map(String::as_str).collect();
     let plan = Plan::new(train, Host::detect(), &with).map_err(|err| (FAILED, format!("{err}\n")))?;
     let report = install_report(&plan).map_err(|err| (FAILED, err))?;
     output.write_all(report.as_bytes()).map_err(io_failed)?;
@@ -201,7 +231,7 @@ mod tests {
     use clap::CommandFactory;
     use clap::error::ErrorKind;
     use sltk_core::platform::{Host, Plan};
-    use sltk_core::train::{Platform, Train};
+    use sltk_core::train::{Platform, Tier, Train};
 
     use std::path::PathBuf;
 
@@ -209,17 +239,155 @@ mod tests {
 
     use super::{
         Choices, Cli, DECLINED, DECLINED_LINE, FAILED, PARTIAL, QUESTION, install_exit_code, install_report,
-        pinned_set, run_install, should_install,
+        optional_tools, pinned_set, run_install, should_install,
     };
 
+    /// A train like the real one with mire listed: fab and arcl essential,
+    /// mire optional, each with an archive for both platforms.
+    const STACK: &str = r#"
+[[tool]]
+name = "fab"
+tier = "essential"
+binary = "fab"
+version = "0.8.0"
+url = "https://example.test/v{version}/{archive}"
+
+[tool.platforms.aarch64-apple-darwin]
+archive = "fab-aarch64-apple-darwin.tar.xz"
+sha256 = "bd8c707af7c6088c1afdf57ff5b9e9f1c4f4830d0dabf1432c4b5ebaced33fe0"
+
+[tool.platforms.x86_64-unknown-linux-gnu]
+archive = "fab-x86_64-unknown-linux-gnu.tar.xz"
+sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
+
+[[tool]]
+name = "arcl"
+tier = "essential"
+binary = "arcl"
+version = "0.3.0"
+url = "https://example.test/v{version}/{archive}"
+
+[tool.platforms.aarch64-apple-darwin]
+archive = "arcl-aarch64-apple-darwin.tar.xz"
+sha256 = "7cf3c94e04bac6c9dff4fd357fc8133050fe0dbbca9d4d1dab2e4ecd8c5e13c3"
+
+[tool.platforms.x86_64-unknown-linux-gnu]
+archive = "arcl-x86_64-unknown-linux-musl.tar.xz"
+sha256 = "80f6bc7e4ce41f7037c91330c814d94e277aed381d192960d00a130a859675e3"
+
+[[tool]]
+name = "mire"
+tier = "optional"
+binary = "mire"
+version = "0.1.0"
+url = "https://example.test/v{version}/{archive}"
+
+[tool.platforms.aarch64-apple-darwin]
+archive = "mire-aarch64-apple-darwin.tar.xz"
+sha256 = "bd8c707af7c6088c1afdf57ff5b9e9f1c4f4830d0dabf1432c4b5ebaced33fe0"
+
+[tool.platforms.x86_64-unknown-linux-gnu]
+archive = "mire-x86_64-unknown-linux-gnu.tar.xz"
+sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
+"#;
+
+    /// What the picker lists for [`STACK`].
+    const STACK_LIST: &str = "Always installed: fab, arcl\nOptional:\n  1. [ ] mire\n";
+
+    /// The optional tools [`optional_tools`] settles on for [`STACK`] when
+    /// `typed` is the answer, and what it wrote.
+    fn optional(yes: bool, terminal: bool, with: &[String], typed: &str) -> (Vec<String>, String) {
+        let train = Train::parse(STACK).unwrap();
+        let mut output = Vec::new();
+        let picked = optional_tools(
+            &train,
+            &Choices { yes, terminal, with },
+            &mut typed.as_bytes(),
+            &mut output,
+        );
+        (picked.unwrap(), String::from_utf8(output).unwrap())
+    }
+
+    #[test]
+    fn on_a_terminal_without_flags_the_picker_offers_mire_unticked() {
+        let (picked, output) = optional(false, true, &[], "\n");
+        assert!(picked.is_empty());
+        assert!(output.starts_with(STACK_LIST), "{output}");
+        assert_eq!(optional(false, true, &[], "1\n").0, ["mire"]);
+        assert_eq!(optional(false, true, &[], "mire\n").0, ["mire"]);
+        assert!(optional(false, true, &[], "").0.is_empty());
+    }
+
+    #[test]
+    fn off_a_terminal_the_picker_stays_closed() {
+        assert_eq!(optional(false, false, &[], "1\n"), (Vec::new(), String::new()));
+        let with = ["mire".to_owned()];
+        assert_eq!(optional(false, false, &with, "\n"), (with.to_vec(), String::new()));
+    }
+
+    #[test]
+    fn with_or_yes_closes_the_picker() {
+        let with = ["mire".to_owned()];
+        assert_eq!(optional(false, true, &with, "\n"), (with.to_vec(), String::new()));
+        assert_eq!(optional(true, true, &[], "1\n"), (Vec::new(), String::new()));
+    }
+
+    #[test]
+    fn a_train_with_no_optional_tool_skips_the_picker() {
+        let mut train = Train::parse(STACK).unwrap();
+        train.tools.retain(|tool| tool.tier == Tier::Essential);
+        let mut output = Vec::new();
+        let choices = Choices { yes: false, terminal: true, with: &[] };
+        let picked = optional_tools(&train, &choices, &mut "1\n".as_bytes(), &mut output).unwrap();
+        assert!(picked.is_empty());
+        assert!(output.is_empty());
+    }
+
+    /// On a terminal the picker comes first, its choice joins the plan, and
+    /// the confirmation follows it.
+    #[test]
+    fn a_picked_tool_joins_the_plan_before_the_confirmation() {
+        if Host::detect().platform().is_none() {
+            return;
+        }
+        let train = Train::parse(STACK).unwrap();
+        let choices = Choices { yes: false, terminal: true, with: &[] };
+        let mut output = Vec::new();
+        let code = run_install(&train, choices, &mut "1\nn\n".as_bytes(), &mut output).unwrap();
+        assert_eq!(code, DECLINED);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.starts_with(STACK_LIST), "{output}");
+        assert!(output.contains("\n  mire 0.1.0 from mire-"), "{output}");
+        assert!(output.ends_with(&format!("{QUESTION}{DECLINED_LINE}")), "{output}");
+    }
+
+    /// End of input at the picker adds nothing, and at the confirmation means
+    /// no.
+    #[test]
+    fn end_of_input_picks_nothing_and_installs_nothing() {
+        if Host::detect().platform().is_none() {
+            return;
+        }
+        let train = Train::parse(STACK).unwrap();
+        let choices = Choices { yes: false, terminal: true, with: &[] };
+        let mut output = Vec::new();
+        let code = run_install(&train, choices, &mut "".as_bytes(), &mut output).unwrap();
+        assert_eq!(code, DECLINED);
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains("  mire 0.1.0 from"), "{output}");
+        assert!(output.ends_with(&format!("{QUESTION}\n{DECLINED_LINE}")), "{output}");
+    }
+
     /// Answering no on a terminal prints the plan and the declined line, and
-    /// exits 3 before any download.
+    /// exits 3 before any download. The train has no optional tool, so the
+    /// confirmation is the only question.
     #[test]
     fn a_declined_install_exits_3_and_downloads_nothing() {
         if Host::detect().platform().is_none() {
             return;
         }
-        let train = Train::embedded().unwrap();
+        let mut train = Train::parse(STACK).unwrap();
+        train.tools.retain(|tool| tool.tier == Tier::Essential);
         let choices = Choices { yes: false, terminal: true, with: &[] };
         let mut output = Vec::new();
         let code = run_install(&train, choices, &mut "no\n".as_bytes(), &mut output).unwrap();
