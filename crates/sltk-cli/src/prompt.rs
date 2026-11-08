@@ -3,8 +3,8 @@
 
 use std::io::{self, BufRead, Read, Write};
 
-/// How many times [`confirm`] and [`pick`] ask before they treat the answers
-/// as no: the first question and three re-asks.
+/// How many times [`confirm`], [`pick`] and [`ask`] ask before they give up:
+/// the first question and three re-asks.
 const ASKS: usize = 4;
 
 /// The most bytes of one answer line that [`read_answer`] keeps. It discards
@@ -110,9 +110,33 @@ fn chosen(line: &str, optional: &[&str]) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// Writes `question` and reads one line of answer, trimmed. An answer that
+/// `valid` rejects is written back with the reason, and the question asked
+/// again, up to [`ASKS`] times in all. An answer that is not UTF-8 reaches
+/// `valid` with U+FFFD in place of the bad bytes. Returns `None` when every
+/// answer was rejected or input ended.
+pub fn ask(
+    input: &mut impl BufRead, output: &mut impl Write, question: &str, valid: impl Fn(&str) -> Result<(), String>,
+) -> io::Result<Option<String>> {
+    for _ in 0..ASKS {
+        write!(output, "{question}")?;
+        output.flush()?;
+        let Some(line) = read_answer(input)? else {
+            writeln!(output)?;
+            return Ok(None);
+        };
+        let answer = line.trim();
+        match valid(answer) {
+            Ok(()) => return Ok(Some(answer.to_owned())),
+            Err(reason) => writeln!(output, "that answer {reason}")?,
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LINE_BYTES, PICK_QUESTION, confirm, pick};
+    use super::{LINE_BYTES, PICK_QUESTION, ask, confirm, pick};
 
     const QUESTION: &str = "Install these? [Y/n] ";
 
@@ -246,5 +270,40 @@ mod tests {
         assert!(picked.is_empty());
         assert_eq!(output.matches(PICK_QUESTION).count(), 4);
         assert!(output.ends_with(PICK_QUESTION), "{output}");
+    }
+
+    fn asked(typed: &str) -> (Option<String>, String) {
+        let mut output = Vec::new();
+        let not_empty = |a: &str| if a.is_empty() { Err("is empty".to_owned()) } else { Ok(()) };
+        let answer = ask(&mut typed.as_bytes(), &mut output, "Owner? ", not_empty).unwrap();
+        (answer, String::from_utf8(output).unwrap())
+    }
+
+    #[test]
+    fn ask_returns_the_trimmed_answer() {
+        assert_eq!(asked("  octo \n"), (Some("octo".to_owned()), "Owner? ".to_owned()));
+    }
+
+    #[test]
+    fn ask_repeats_a_rejected_answer_with_the_reason() {
+        let again = "Owner? that answer is empty\nOwner? ".to_owned();
+        assert_eq!(asked("\nocto\n"), (Some("octo".to_owned()), again));
+    }
+
+    #[test]
+    fn ask_gives_up_after_four_rejections_or_at_end_of_input() {
+        let (answer, output) = asked("\n\n\n\nocto\n");
+        assert_eq!(answer, None);
+        assert_eq!(output.matches("Owner? ").count(), 4);
+        assert_eq!(asked(""), (None, "Owner? \n".to_owned()));
+    }
+
+    #[test]
+    fn ask_reads_an_answer_that_is_not_utf8_as_a_wrong_one() {
+        let mut output = Vec::new();
+        let ascii = |a: &str| if a.is_ascii() { Ok(()) } else { Err("is not ASCII".to_owned()) };
+        let answer = ask(&mut &b"oct\xff\nocto\n"[..], &mut output, "Owner? ", ascii).unwrap();
+        assert_eq!(answer, Some("octo".to_owned()));
+        assert_eq!(String::from_utf8(output).unwrap(), "Owner? that answer is not ASCII\nOwner? ");
     }
 }

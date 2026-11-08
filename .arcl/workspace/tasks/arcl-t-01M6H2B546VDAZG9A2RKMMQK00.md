@@ -2,7 +2,7 @@
 id = "arcl-t-01M6H2B546VDAZG9A2RKMMQK00"
 parent = "arcl-t-01M6H2B51T9ZV42EXGEQ7GQV5X"
 title = "Run fab init and arcl setup from sltk init"
-status = "pending"
+status = "in_progress"
 priority = "normal"
 position = 2
 blocked-by = ["arcl-t-01M6H2B4ZF2SX34E7YSBVGKWFJ", "arcl-t-01M6H2B53NKD1JFH0BCHTW0EA2"]
