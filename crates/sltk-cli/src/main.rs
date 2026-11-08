@@ -6,7 +6,9 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use sltk_core::doctor::{self, Machine, Report};
 use sltk_core::install::{self, HttpFetch, InstallError};
+use sltk_core::pin::Pin;
 use sltk_core::platform::{Host, Plan};
 use sltk_core::train::{Tier, Train};
 
@@ -20,6 +22,10 @@ const DECLINED: u8 = 3;
 /// The exit code of an install that replaced some tools and then failed, so
 /// the bin directory holds a mix of new and old binaries.
 const PARTIAL: u8 = 4;
+
+/// The exit code of `sltk doctor` when it could not finish its checks, as
+/// when the pin cannot be read.
+const DOCTOR_ERROR: u8 = 2;
 
 /// The question `sltk install` asks on a terminal without `--yes`.
 const QUESTION: &str = "Install these? [Y/n] ";
@@ -61,6 +67,17 @@ enum Command {
         #[arg(long = "with", value_name = "TOOL")]
         with: Vec<String>,
     },
+    /// Report what is wrong with the installed tools. Changes nothing.
+    ///
+    /// Checks fab and arcl, and each optional tool that .github/sltk.toml
+    /// lists, or, outside a repository with a pin, each one installed. It
+    /// reports a tool missing from the bin directory, a version other than
+    /// the train's, a binary PATH finds before the bin directory's, and
+    /// whether that one is Homebrew's, a bin directory missing from PATH,
+    /// and a pin of another sltk release. Exits 0 when nothing is wrong, 1
+    /// when something is, and 2 when it could not check, as when the pin
+    /// cannot be read.
+    Doctor,
 }
 
 /// What a person chose for `sltk install`, by flag or by where it runs.
@@ -105,6 +122,7 @@ fn main() -> ExitCode {
                 &mut output,
             )
         }
+        Command::Doctor => run_doctor(&train),
     };
     match result {
         Ok(code) => ExitCode::from(code),
@@ -197,6 +215,39 @@ fn run_install(
     Ok(0)
 }
 
+/// Runs `sltk doctor` on this machine, with the pin of the repository the
+/// current directory is in, if it has one. Returns the exit code, or the exit
+/// code and the error to print.
+fn run_doctor(train: &Train) -> Result<u8, (u8, String)> {
+    let error = |err: &dyn std::fmt::Display| (DOCTOR_ERROR, format!("sltk: {err}\n"));
+    let machine = Machine::from_env().map_err(|err| (DOCTOR_ERROR, format!("{err}\n")))?;
+    let cwd = std::env::current_dir().map_err(|err| error(&err))?;
+    let pin = match doctor::find_pin_root(&cwd) {
+        Some(root) => Some(Pin::read(&root, train).map_err(|err| error(&err))?),
+        None => None,
+    };
+    let report = doctor::check(train, pin.as_ref(), sltk_core::VERSION, &machine);
+    print!("{}", doctor_report(&report, &machine));
+    Ok(if report.findings.is_empty() { 0 } else { FAILED })
+}
+
+/// What `sltk doctor` prints: one line per finding, then a line naming the
+/// tools checked and how many problems it found.
+fn doctor_report(report: &Report, machine: &Machine) -> String {
+    let mut out: String = report.findings.iter().map(|finding| format!("{finding}\n")).collect();
+    let problems = match report.findings.len() {
+        0 => "no problems".to_owned(),
+        1 => "1 problem".to_owned(),
+        n => format!("{n} problems"),
+    };
+    out.push_str(&format!(
+        "sltk doctor: checked {} in {}: {problems}\n",
+        report.checked.join(", "),
+        machine.bin.display()
+    ));
+    out
+}
+
 /// What `sltk install` prints for a plan: the tools and archives it will
 /// install, or, as an error, the tools with no archive for the host.
 fn install_report(plan: &Plan) -> Result<String, String> {
@@ -237,9 +288,11 @@ mod tests {
 
     use sltk_core::install::InstallError;
 
+    use sltk_core::doctor::{Finding, Machine, Report};
+
     use super::{
-        Choices, Cli, DECLINED, DECLINED_LINE, FAILED, PARTIAL, QUESTION, install_exit_code, install_report,
-        optional_tools, pinned_set, run_install, should_install,
+        Choices, Cli, DECLINED, DECLINED_LINE, FAILED, PARTIAL, QUESTION, doctor_report, install_exit_code,
+        install_report, optional_tools, pinned_set, run_install, should_install,
     };
 
     /// A train like the real one with mire listed: fab and arcl essential,
@@ -520,6 +573,31 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
         assert_eq!(
             install_report(&plan).unwrap_err(),
             "sltk: these tools have no archive for x86_64-unknown-linux-gnu:\n  beta 0.1.0\n"
+        );
+    }
+
+    #[test]
+    fn doctor_prints_each_finding_then_a_summary() {
+        let machine = Machine {
+            path: None,
+            bin: PathBuf::from("/h/.cargo/bin"),
+            brew_prefixes: Vec::new(),
+            timeout: std::time::Duration::from_secs(5),
+        };
+        let mut report = Report { checked: vec!["fab".into(), "arcl".into()], findings: Vec::new() };
+        assert_eq!(
+            doctor_report(&report, &machine),
+            "sltk doctor: checked fab, arcl in /h/.cargo/bin: no problems\n"
+        );
+        report.findings.push(Finding::BinNotOnPath { bin: machine.bin.clone() });
+        report
+            .findings
+            .push(Finding::Missing { tool: "arcl".into(), path: PathBuf::from("/h/.cargo/bin/arcl") });
+        assert_eq!(
+            doctor_report(&report, &machine),
+            "PATH does not include /h/.cargo/bin\n\
+             arcl: /h/.cargo/bin/arcl is not installed\n\
+             sltk doctor: checked fab, arcl in /h/.cargo/bin: 2 problems\n"
         );
     }
 }

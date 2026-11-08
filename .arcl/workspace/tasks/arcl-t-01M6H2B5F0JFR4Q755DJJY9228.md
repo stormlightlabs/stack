@@ -2,7 +2,7 @@
 id = "arcl-t-01M6H2B5F0JFR4Q755DJJY9228"
 parent = "arcl-t-01M6H2B5DNJQDEJ0AVAKFJW534"
 title = "Report machine problems with sltk doctor"
-status = "pending"
+status = "in_progress"
 priority = "normal"
 position = 0
 blocked-by = ["arcl-t-01M6H2B4ZF2SX34E7YSBVGKWFJ"]
