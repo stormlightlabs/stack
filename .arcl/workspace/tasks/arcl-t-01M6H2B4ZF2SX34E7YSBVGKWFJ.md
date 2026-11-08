@@ -2,7 +2,7 @@
 id = "arcl-t-01M6H2B4ZF2SX34E7YSBVGKWFJ"
 parent = "arcl-t-01M6H2B4X9KF5M9GWPPJ3CJ2ZQ"
 title = "Install tools from pinned release archives"
-status = "pending"
+status = "in_progress"
 priority = "normal"
 position = 2
 blocked-by = ["arcl-t-01M6H2B4YXHTGS3010SYPPVR95"]

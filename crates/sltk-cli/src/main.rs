@@ -3,27 +3,41 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use sltk_core::install::{self, HttpFetch};
 use sltk_core::platform::{Host, Plan};
 use sltk_core::train::Train;
 
-/// The exit code of `sltk install` after it prints a plan for a supported
-/// machine: nothing was installed, so a script must not read it as success.
+/// The exit code of `sltk install` without `--yes`: it printed the plan and
+/// installed nothing, so a script must not read it as success.
 const NOT_INSTALLED: u8 = 3;
 
-/// The last line `sltk install` prints after a plan for a supported machine.
-const NOT_INSTALLED_LINE: &str = "sltk: nothing was installed, because downloading is not built yet\n";
+/// The last line `sltk install` prints without `--yes`.
+const NOT_INSTALLED_LINE: &str = "sltk: nothing was installed; run sltk install --yes to install\n";
 
 /// The commands `sltk` runs.
 #[derive(Subcommand)]
 enum Command {
     /// Print the version and tier of each tool this release pins.
     Train,
-    /// Print the tools and archives an install on this machine would use.
+    /// Install the pinned fab and arcl, and any tool named with --with.
     ///
-    /// Downloading comes in a later release: for now this prints the plan,
-    /// installs nothing and exits 3. Exits 1, naming the tools, when a tool
-    /// has no archive for this machine.
-    Install,
+    /// Downloads each tool's release archive, checks it against the sha256
+    /// the train pins, and puts the binary in $CARGO_HOME/bin, or
+    /// ~/.cargo/bin when CARGO_HOME is not set. It downloads and checks
+    /// every archive before it writes anything.
+    ///
+    /// Without --yes it prints what it would install, installs nothing and
+    /// exits 3. Exits 0 once every tool is installed, and 1 when a tool has
+    /// no archive for this machine, a --with name is wrong, or a download or
+    /// hash check fails.
+    Install {
+        /// Install the plan. Without it, sltk prints the plan and stops.
+        #[arg(long)]
+        yes: bool,
+        /// Also install this optional tool. Repeat for more than one.
+        #[arg(long = "with", value_name = "TOOL")]
+        with: Vec<String>,
+    },
 }
 
 /// sltk: installs fabrial, arclightning and, if asked, Mire onto a machine and
@@ -45,17 +59,14 @@ fn main() -> ExitCode {
         }
     };
     let result = match command {
-        Command::Train => Ok((pinned_set(&train), 0)),
-        Command::Install => match Plan::new(&train, Host::detect(), &[]) {
-            Ok(plan) => install_report(&plan).map(|out| (out, NOT_INSTALLED)),
-            Err(err) => Err(format!("{err}\n")),
-        },
+        Command::Train => {
+            print!("{}", pinned_set(&train));
+            Ok(0)
+        }
+        Command::Install { yes, with } => run_install(&train, yes, &with),
     };
     match result {
-        Ok((out, code)) => {
-            print!("{out}");
-            ExitCode::from(code)
-        }
+        Ok(code) => ExitCode::from(code),
         Err(err) => {
             eprint!("{err}");
             ExitCode::FAILURE
@@ -63,9 +74,27 @@ fn main() -> ExitCode {
     }
 }
 
-/// What `sltk install` prints for a plan: the tools and archives it would
-/// install, then a line saying it installed nothing, or, as an error, the
-/// tools with no archive for the host.
+/// Runs `sltk install`: prints the plan, then installs it when `yes` is set.
+/// Returns the exit code, or the error to print.
+fn run_install(train: &Train, yes: bool, with: &[String]) -> Result<u8, String> {
+    let with: Vec<&str> = with.iter().map(String::as_str).collect();
+    let plan = Plan::new(train, Host::detect(), &with).map_err(|err| format!("{err}\n"))?;
+    print!("{}", install_report(&plan)?);
+    if !yes {
+        print!("{NOT_INSTALLED_LINE}");
+        return Ok(NOT_INSTALLED);
+    }
+    let bin =
+        install::bin_dir(std::env::var_os("CARGO_HOME"), std::env::var_os("HOME")).map_err(|err| format!("{err}\n"))?;
+    let installed = install::install(&plan, &HttpFetch::new(), &bin).map_err(|err| format!("{err}\n"))?;
+    for tool in installed {
+        println!("installed {} {} to {}", tool.name, tool.version, tool.path.display());
+    }
+    Ok(0)
+}
+
+/// What `sltk install` prints for a plan: the tools and archives it will
+/// install, or, as an error, the tools with no archive for the host.
 fn install_report(plan: &Plan) -> Result<String, String> {
     if !plan.is_complete() {
         let mut err = format!("sltk: these tools have no archive for {}:\n", plan.host);
@@ -74,14 +103,13 @@ fn install_report(plan: &Plan) -> Result<String, String> {
         }
         return Err(err);
     }
-    let mut out = format!("sltk would install on {}:\n", plan.host);
+    let mut out = format!("sltk plan for {}:\n", plan.host);
     for tool in &plan.install {
         out.push_str(&format!(
             "  {} {} from {}\n",
             tool.name, tool.version, tool.archive.name
         ));
     }
-    out.push_str(NOT_INSTALLED_LINE);
     Ok(out)
 }
 
@@ -158,8 +186,7 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
         let plan = Plan::new(&train, Host::Supported(Platform::LinuxX86_64), &[]).unwrap();
         assert_eq!(
             install_report(&plan).unwrap(),
-            "sltk would install on x86_64-unknown-linux-gnu:\n  alpha 1.2.3 from alpha-x86_64-unknown-linux-gnu.tar.xz\n\
-             sltk: nothing was installed, because downloading is not built yet\n"
+            "sltk plan for x86_64-unknown-linux-gnu:\n  alpha 1.2.3 from alpha-x86_64-unknown-linux-gnu.tar.xz\n"
         );
     }
 

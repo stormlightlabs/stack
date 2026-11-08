@@ -125,8 +125,13 @@ pub struct PlannedTool {
     pub name: String,
     /// The pinned release.
     pub version: String,
+    /// The binary the archive holds.
+    pub binary: String,
     /// The archive for the host's platform.
     pub archive: Archive,
+    /// The archive's download URL: the tool's template with `{version}` and
+    /// `{archive}` replaced.
+    pub url: String,
 }
 
 /// A tool the plan cannot install, because the train has no archive of it for
@@ -175,7 +180,12 @@ impl Plan {
                 Some(archive) => install.push(PlannedTool {
                     name: tool.name.clone(),
                     version: tool.version.clone(),
+                    binary: tool.binary.clone(),
                     archive: archive.clone(),
+                    url: tool
+                        .url
+                        .replace("{version}", &tool.version)
+                        .replace("{archive}", &archive.name),
                 }),
                 None => unsupported.push(UnsupportedTool { name: tool.name.clone(), version: tool.version.clone() }),
             }
@@ -313,8 +323,19 @@ sha256 = "80f6bc7e4ce41f7037c91330c814d94e277aed381d192960d00a130a859675e3"
                 let tool = train.tools.iter().find(|t| t.name == planned.name).unwrap();
                 assert_eq!(planned.archive, tool.platforms[&platform]);
                 assert_eq!(planned.version, tool.version);
+                assert_eq!(planned.binary, tool.binary);
             }
         }
+    }
+
+    #[test]
+    fn the_url_has_the_version_and_archive_filled_in() {
+        let train = Train::parse(FIXTURE).unwrap();
+        let plan = Plan::new(&train, Host::Supported(Platform::LinuxX86_64), &[]).unwrap();
+        assert_eq!(
+            plan.install[0].url,
+            "https://example.test/v1.2.3/alpha-x86_64-unknown-linux-gnu.tar.xz"
+        );
     }
 
     #[test]
