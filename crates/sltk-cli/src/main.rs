@@ -8,7 +8,6 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use sltk_core::doctor::{self, Machine, Report};
 use sltk_core::install::{self, HttpFetch, InstallError};
-use sltk_core::pin::Pin;
 use sltk_core::platform::{Host, Plan};
 use sltk_core::train::{Tier, Train};
 
@@ -223,7 +222,7 @@ fn run_doctor(train: &Train) -> Result<u8, (u8, String)> {
     let machine = Machine::from_env().map_err(|err| (DOCTOR_ERROR, format!("{err}\n")))?;
     let cwd = std::env::current_dir().map_err(|err| error(&err))?;
     let pin = match doctor::find_pin_root(&cwd) {
-        Some(root) => Some(Pin::read(&root, train).map_err(|err| error(&err))?),
+        Some(root) => Some(doctor::read_pin(&root, train, sltk_core::VERSION).map_err(|err| error(&err))?),
         None => None,
     };
     let report = doctor::check(train, pin.as_ref(), sltk_core::VERSION, &machine);

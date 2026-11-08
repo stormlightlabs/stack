@@ -92,3 +92,29 @@ fn an_unreadable_pin_exits_2() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.starts_with("sltk: .github/sltk.toml: "), "{stderr}");
 }
+
+#[test]
+fn a_pin_of_another_release_is_a_finding_and_exits_1() {
+    let (_root, repo, cargo_home) = setup();
+    let bin = cargo_home.join("bin");
+    fake_essentials(&bin);
+    std::fs::create_dir_all(repo.join(".github")).unwrap();
+    // A target this release has no hash key for, as a later release might add.
+    std::fs::write(
+        repo.join(".github/sltk.toml"),
+        "version = \"9.9.9\"\nsha256-aarch64-unknown-linux-gnu = \"00\"\n",
+    )
+    .unwrap();
+    let output = doctor(&repo, &cargo_home, &bin);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    let running = sltk_core::VERSION;
+    assert_eq!(
+        stdout,
+        format!(
+            ".github/sltk.toml: pins sltk 9.9.9, but this is sltk {running}; doctor checks the tools sltk {running} pins\n\
+             sltk doctor: checked fab, arcl in {}: 1 problem\n",
+            bin.display()
+        )
+    );
+}

@@ -128,7 +128,7 @@ impl Pin {
     /// the lines the session hook reads, and each optional tool must be an
     /// optional tool in `train`.
     pub fn parse(text: &str, train: &Train) -> Result<Pin, PinError> {
-        let line_version = hook_line(text, "version", is_hook_version).ok_or(PinError::MissingVersionLine)?;
+        let line_version = read_version(text).ok_or(PinError::MissingVersionLine)?;
         let mut line_hashes = BTreeMap::new();
         for platform in TARGETS {
             let hash = hook_line(text, &hash_key(platform), is_hash).ok_or(PinError::MissingHashLine { platform })?;
@@ -213,6 +213,13 @@ struct RawPin {
     /// The `sha256-<target>` values, by key.
     #[serde(flatten)]
     sha256: BTreeMap<String, String>,
+}
+
+/// The version on the line `version = "x.y.z"` the session hook reads, if the
+/// text of a `.github/sltk.toml` has one. It reads that line alone, so it
+/// gives the version of a pin whose other keys this train does not know.
+pub fn read_version(text: &str) -> Option<&str> {
+    hook_line(text, "version", is_hook_version)
 }
 
 /// Writes `bytes` to a new file at `temp`, syncs it, and renames it over

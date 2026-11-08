@@ -13,7 +13,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use crate::pin::{self, Pin};
+use crate::pin::{self, Pin, PinError};
 use crate::train::{Tier, Tool, Train};
 
 /// How long `<binary> --version` may run before doctor stops it.
@@ -111,11 +111,24 @@ impl fmt::Display for Finding {
             Finding::BinNotOnPath { bin } => write!(f, "PATH does not include {}", bin.display()),
             Finding::PinVersion { pinned, running } => write!(
                 f,
-                "{}: pins sltk {pinned}, but this is sltk {running}, whose train doctor checks",
+                "{}: pins sltk {pinned}, but this is sltk {running}; doctor checks the tools sltk {running} pins",
                 pin::PATH
             ),
         }
     }
+}
+
+/// The repository's pin, as [`read_pin`] finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoPin {
+    /// A pin of this `sltk` release, read whole.
+    Current(Pin),
+    /// A pin of another `sltk` release. Its other keys may name tools or
+    /// targets this train lacks, so only its version is read.
+    Other {
+        /// The release `.github/sltk.toml` pins.
+        version: String,
+    },
 }
 
 /// What doctor reads from the machine.
@@ -157,17 +170,22 @@ pub struct Report {
 
 /// Checks the tools `train` lists on `machine`.
 ///
-/// The essentials are always checked. With a `pin`, so do the optional tools
-/// it lists, and a pin of another release than `running` is a finding.
-/// Without one, an optional tool is checked only when the bin directory has
-/// it.
-pub fn check(train: &Train, pin: Option<&Pin>, running: &str, machine: &Machine) -> Report {
+/// The essentials are always checked. With a pin of this release, so are the
+/// optional tools it lists. A pin of another release than `running` is a
+/// finding, and doctor then treats the repository as unpinned: an optional
+/// tool is checked only when the bin directory has it.
+pub fn check(train: &Train, pin: Option<&RepoPin>, running: &str, machine: &Machine) -> Report {
     let mut report = Report { checked: Vec::new(), findings: Vec::new() };
-    if let Some(pin) = pin.filter(|pin| pin.version != running) {
-        report
-            .findings
-            .push(Finding::PinVersion { pinned: pin.version.clone(), running: running.to_owned() });
-    }
+    let pin = match pin {
+        Some(RepoPin::Current(pin)) => Some(pin),
+        Some(RepoPin::Other { version }) => {
+            report
+                .findings
+                .push(Finding::PinVersion { pinned: version.clone(), running: running.to_owned() });
+            None
+        }
+        None => None,
+    };
     let bin_on_path = path_dirs(machine.path.as_ref()).any(|dir| same_file(&dir, &machine.bin));
     if !bin_on_path {
         report.findings.push(Finding::BinNotOnPath { bin: machine.bin.clone() });
@@ -192,6 +210,19 @@ pub fn find_pin_root(start: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Reads `.github/sltk.toml` under `root`. When its version line names a
+/// release other than `running`, only that version is read, since the rest
+/// follows another train. Otherwise the whole pin is read against `train`,
+/// and a pin without a version line fails as [`Pin::parse`] says.
+pub fn read_pin(root: &Path, train: &Train, running: &str) -> Result<RepoPin, PinError> {
+    let path = root.join(pin::PATH);
+    let text = std::fs::read_to_string(&path).map_err(|source| PinError::Io { path, source })?;
+    match pin::read_version(&text) {
+        Some(version) if version != running => Ok(RepoPin::Other { version: version.to_owned() }),
+        _ => Pin::parse(&text, train).map(RepoPin::Current),
+    }
 }
 
 /// The first `x.y.z` in `text`: three runs of digits joined by dots, not
@@ -381,8 +412,8 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use super::{Finding, Machine, Report, check, find_pin_root, parse_version};
-    use crate::pin::Pin;
+    use super::{Finding, Machine, RepoPin, Report, check, find_pin_root, parse_version, read_pin};
+    use crate::pin::{Pin, PinError};
     use crate::train::Train;
 
     /// fab and arcl essential, mire optional.
@@ -473,17 +504,24 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
             }
         }
 
-        fn check(&self, pin: Option<&Pin>, path: &[&str]) -> Report {
+        fn check(&self, pin: Option<&RepoPin>, path: &[&str]) -> Report {
             check(&self.train, pin, "0.2.0", &self.machine(path))
         }
     }
 
-    fn pin(version: &str, optional: &[&str]) -> Pin {
-        Pin {
-            version: version.to_owned(),
+    /// A pin of the release the fixture runs as, listing `optional`.
+    fn pin(optional: &[&str]) -> RepoPin {
+        RepoPin::Current(Pin {
+            version: "0.2.0".to_owned(),
             sha256: Default::default(),
             optional: optional.iter().map(|s| s.to_string()).collect(),
-        }
+        })
+    }
+
+    /// Writes `text` as `.github/sltk.toml` under `root`.
+    fn write_pin(root: &std::path::Path, text: &str) {
+        std::fs::create_dir_all(root.join(".github")).unwrap();
+        std::fs::write(root.join(".github/sltk.toml"), text).unwrap();
     }
 
     #[test]
@@ -573,13 +611,15 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
     fn a_homebrew_binary_ahead_on_path_is_reported() {
         let fixture = Fixture::new();
         fixture.good();
-        // Homebrew links bin/fab to its Cellar; doctor resolves the link.
+        // The link sits outside the Homebrew prefix and points into its
+        // Cellar, so only the resolved path shows it is Homebrew's.
         let cellar = fixture.dir("brew/Cellar/fab/0.7.0/bin");
         std::fs::create_dir_all(&cellar).unwrap();
+        std::fs::create_dir_all(fixture.dir("other/bin")).unwrap();
         let real = fixture.fake("brew/Cellar/fab/0.7.0/bin", "fab", "fab 0.7.0");
-        let link = fixture.dir("brew/bin/fab");
+        let link = fixture.dir("other/bin/fab");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        let report = fixture.check(None, &["brew/bin", "cargo/bin"]);
+        let report = fixture.check(None, &["other/bin", "cargo/bin"]);
         let finding = Finding::Shadowed {
             tool: "fab".into(),
             found: link.clone(),
@@ -662,21 +702,49 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
     fn a_pin_of_another_release_is_reported() {
         let fixture = Fixture::new();
         fixture.good();
-        let report = fixture.check(Some(&pin("0.1.0", &[])), &["cargo/bin"]);
+        let other = RepoPin::Other { version: "0.1.0".into() };
+        let report = fixture.check(Some(&other), &["cargo/bin"]);
         let finding = Finding::PinVersion { pinned: "0.1.0".into(), running: "0.2.0".into() };
         assert_eq!(report.findings, [finding]);
         assert_eq!(
             report.findings[0].to_string(),
-            ".github/sltk.toml: pins sltk 0.1.0, but this is sltk 0.2.0, whose train doctor checks"
+            ".github/sltk.toml: pins sltk 0.1.0, but this is sltk 0.2.0; doctor checks the tools sltk 0.2.0 pins"
         );
-        assert_eq!(fixture.check(Some(&pin("0.2.0", &[])), &["cargo/bin"]).findings, []);
+        assert_eq!(fixture.check(Some(&pin(&[])), &["cargo/bin"]).findings, []);
+    }
+
+    #[test]
+    fn a_pin_of_another_release_is_read_by_its_version_line_alone() {
+        let root = tempfile::tempdir().unwrap();
+        // A target this train has no hash key for: the full parse rejects it.
+        write_pin(
+            root.path(),
+            "version = \"9.9.9\"\nsha256-aarch64-unknown-linux-gnu = \"00\"\noptional = [\"zed\"]\n",
+        );
+        let train = Train::parse(TRAIN).unwrap();
+        assert_eq!(
+            read_pin(root.path(), &train, "0.2.0").unwrap(),
+            RepoPin::Other { version: "9.9.9".into() }
+        );
+        // The same file pinning this release is read whole, and fails.
+        let err = read_pin(root.path(), &train, "9.9.9").unwrap_err();
+        assert!(matches!(err, PinError::MissingHashLine { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_pin_without_a_version_line_fails_to_read() {
+        let root = tempfile::tempdir().unwrap();
+        write_pin(root.path(), "version = \"9.9\"\n");
+        let train = Train::parse(TRAIN).unwrap();
+        let err = read_pin(root.path(), &train, "0.2.0").unwrap_err();
+        assert!(matches!(err, PinError::MissingVersionLine), "{err}");
     }
 
     #[test]
     fn a_pinned_optional_tool_is_checked() {
         let fixture = Fixture::new();
         fixture.good();
-        let report = fixture.check(Some(&pin("0.2.0", &["mire"])), &["cargo/bin"]);
+        let report = fixture.check(Some(&pin(&["mire"])), &["cargo/bin"]);
         assert_eq!(report.checked, ["fab", "arcl", "mire"]);
         assert_eq!(
             report.findings,
@@ -722,5 +790,12 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
         let inner = repo.join("inner");
         std::fs::create_dir_all(inner.join(".git")).unwrap();
         assert_eq!(find_pin_root(&inner), None);
+        // A worktree's .git is a file, and it bounds the search the same way.
+        let worktree = repo.join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: ../.git/worktrees/worktree\n").unwrap();
+        assert_eq!(find_pin_root(&worktree), None);
+        write_pin(&worktree, "");
+        assert_eq!(find_pin_root(&worktree).as_deref(), Some(worktree.as_path()));
     }
 }
