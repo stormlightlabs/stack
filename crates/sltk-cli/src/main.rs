@@ -23,7 +23,7 @@ enum Command {
     ///
     /// Downloads each tool's release archive, checks it against the sha256
     /// the train pins, and puts the binary in $CARGO_HOME/bin, or
-    /// ~/.cargo/bin when CARGO_HOME is not set. It downloads and checks
+    /// ~/.cargo/bin when CARGO_HOME is unset or empty. It downloads and checks
     /// every archive before it writes anything.
     ///
     /// Without --yes it prints what it would install, installs nothing and

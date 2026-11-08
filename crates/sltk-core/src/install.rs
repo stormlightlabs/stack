@@ -27,8 +27,13 @@ pub const MAX_UNPACKED: u64 = 256 << 20;
 /// The most bytes one binary may hold. arcl 0.3.0 is about 17 MB.
 pub const MAX_BINARY: u64 = 128 << 20;
 
-/// Why an install stopped. When it stops before the renames, which is every
-/// case but [`InstallError::Io`] on a rename, the bin directory is as it was.
+/// How many temporary names `stage` tries before it gives up. Each name
+/// carries a random suffix, so a second try only happens when a file is
+/// already there.
+const STAGE_ATTEMPTS: u32 = 8;
+
+/// Why an install stopped. Every error but [`InstallError::Partial`] leaves
+/// the bin directory as it was.
 #[derive(Debug, thiserror::Error)]
 pub enum InstallError {
     /// The plan has tools with no archive for the host.
@@ -108,6 +113,20 @@ pub enum InstallError {
     /// Neither `CARGO_HOME` nor `HOME` is set.
     #[error("sltk: neither CARGO_HOME nor HOME is set, so there is no bin directory to install into")]
     NoBinDir,
+    /// A rename failed after earlier tools were already replaced.
+    #[error(
+        "sltk: {}: {source}\n  the install is partial: {} replaced, the rest left as they were",
+        path.display(),
+        replaced.join(", ")
+    )]
+    Partial {
+        /// The target the rename failed on.
+        path: PathBuf,
+        /// The error the OS reported.
+        source: io::Error,
+        /// The tools already replaced, in install order.
+        replaced: Vec<String>,
+    },
     /// Writing to the bin directory failed.
     #[error("sltk: {}: {source}", path.display())]
     Io {
@@ -116,6 +135,13 @@ pub enum InstallError {
         /// The error the OS reported.
         source: io::Error,
     },
+}
+
+/// Opens a URL for reading. [`HttpFetch`] is the real one; tests supply
+/// their own to serve archives from a local server.
+pub trait Fetch {
+    /// Opens `url` and returns its body, or what went wrong.
+    fn open(&self, url: &str) -> Result<Box<dyn Read>, String>;
 }
 
 /// A tool `sltk install` put in the bin directory.
@@ -205,13 +231,6 @@ impl Write for CappedWriter {
     }
 }
 
-/// Opens a URL for reading. [`HttpFetch`] is the real one; tests supply
-/// their own to serve archives from a local server.
-pub trait Fetch {
-    /// Opens `url` and returns its body, or what went wrong.
-    fn open(&self, url: &str) -> Result<Box<dyn Read>, String>;
-}
-
 /// The directory tools install into: `$CARGO_HOME/bin` when `CARGO_HOME` is
 /// set and not empty, else `$HOME/.cargo/bin`. This is where dist's own
 /// installers put them.
@@ -234,7 +253,7 @@ pub fn bin_dir(cargo_home: Option<OsString>, home: Option<OsString>) -> Result<P
 /// rename that fails leaves the tools before it installed and the rest as
 /// they were.
 pub fn install(plan: &Plan, fetch: &dyn Fetch, bin: &Path) -> Result<Vec<Installed>, InstallError> {
-    install_with(plan, fetch, bin, Limits::DEFAULT)
+    install_with(plan, fetch, bin, Limits::DEFAULT, &mut random_suffix)
 }
 
 /// The lowercase hexadecimal sha256 of `bytes`.
@@ -246,8 +265,11 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex
 }
 
-/// [`install`] under the caps in `limits`.
-fn install_with(plan: &Plan, fetch: &dyn Fetch, bin: &Path, limits: Limits) -> Result<Vec<Installed>, InstallError> {
+/// [`install`] under the caps in `limits`, naming temporary files with
+/// suffixes from `suffix`.
+fn install_with(
+    plan: &Plan, fetch: &dyn Fetch, bin: &Path, limits: Limits, suffix: &mut dyn FnMut() -> u64,
+) -> Result<Vec<Installed>, InstallError> {
     let Some(platform) = plan.host.platform().filter(|_| plan.is_complete()) else {
         return Err(InstallError::Incomplete { host: plan.host.to_string() });
     };
@@ -260,7 +282,7 @@ fn install_with(plan: &Plan, fetch: &dyn Fetch, bin: &Path, limits: Limits) -> R
     std::fs::create_dir_all(bin).map_err(|source| InstallError::Io { path: bin.to_owned(), source })?;
     let mut staged: Vec<PathBuf> = Vec::with_capacity(binaries.len());
     for (tool, bytes) in plan.install.iter().zip(&binaries) {
-        match stage(bin, &tool.binary, bytes) {
+        match stage(bin, &tool.binary, bytes, suffix) {
             Ok(temp) => staged.push(temp),
             Err(err) => {
                 remove_all(&staged);
@@ -273,7 +295,11 @@ fn install_with(plan: &Plan, fetch: &dyn Fetch, bin: &Path, limits: Limits) -> R
         let path = bin.join(&tool.binary);
         if let Err(source) = std::fs::rename(temp, &path) {
             remove_all(&staged[i..]);
-            return Err(InstallError::Io { path, source });
+            if installed.is_empty() {
+                return Err(InstallError::Io { path, source });
+            }
+            let replaced = installed.into_iter().map(|done: Installed| done.name).collect();
+            return Err(InstallError::Partial { path, source, replaced });
         }
         installed.push(Installed { name: tool.name.clone(), version: tool.version.clone(), path });
     }
@@ -370,38 +396,71 @@ fn extract(tool: &str, binary: &str, archive: &[u8], limits: Limits) -> Result<V
 }
 
 /// Writes `bytes` to a new temporary file in `bin`, with mode 0755 on Unix,
-/// and syncs it. Returns the file's path; on failure the file is removed.
-fn stage(bin: &Path, binary: &str, bytes: &[u8]) -> Result<PathBuf, InstallError> {
-    let temp = bin.join(format!(".{binary}.sltk-{}.tmp", std::process::id()));
-    let result = write_executable(&temp, bytes);
-    if let Err(source) = result {
-        let _ = std::fs::remove_file(&temp);
-        return Err(InstallError::Io { path: temp, source });
+/// and syncs it. Returns the file's path.
+///
+/// The name carries the process id and a suffix from `suffix`. A name that
+/// is already taken is left alone and the next suffix tried, up to
+/// [`STAGE_ATTEMPTS`] times. Only a file this call created is removed on
+/// failure.
+fn stage(bin: &Path, binary: &str, bytes: &[u8], suffix: &mut dyn FnMut() -> u64) -> Result<PathBuf, InstallError> {
+    let mut attempt = 1;
+    loop {
+        let temp = bin.join(format!(".{binary}.sltk-{}-{:016x}.tmp", std::process::id(), suffix()));
+        let mut file = match create_executable(&temp) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists && attempt < STAGE_ATTEMPTS => {
+                attempt += 1;
+                continue;
+            }
+            Err(source) => return Err(InstallError::Io { path: temp, source }),
+        };
+        if let Err(source) = write_executable(&mut file, bytes) {
+            drop(file);
+            let _ = std::fs::remove_file(&temp);
+            return Err(InstallError::Io { path: temp, source });
+        }
+        return Ok(temp);
     }
-    Ok(temp)
 }
 
-/// Creates `path`, which must not exist, writes `bytes`, makes it
-/// executable and syncs it.
-fn write_executable(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// Creates `path` for writing, failing with `AlreadyExists` when anything is
+/// there, with mode 0755 on Unix.
+fn create_executable(path: &Path) -> io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o755);
-        let mut file = options.open(path)?;
-        file.write_all(bytes)?;
+    }
+    options.open(path)
+}
+
+/// Writes `bytes` to a file `create_executable` made, sets its mode to 0755
+/// on Unix and syncs it.
+fn write_executable(file: &mut std::fs::File, bytes: &[u8]) -> io::Result<()> {
+    file.write_all(bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
         // The mode given at creation is reduced by the umask.
         file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
-        file.sync_all()
     }
-    #[cfg(not(unix))]
-    {
-        let mut file = options.open(path)?;
-        file.write_all(bytes)?;
-        file.sync_all()
+    file.sync_all()
+}
+
+/// A random suffix for a temporary name: the std hasher's per-process
+/// random keys over the time and a counter, so two calls never repeat it.
+fn random_suffix() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+    if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        hasher.write_u128(now.as_nanos());
     }
+    hasher.finish()
 }
 
 /// Removes each file, ignoring failures.
@@ -416,7 +475,7 @@ mod tests {
     use std::io::Read;
     use std::path::Path;
 
-    use super::{Fetch, InstallError, Limits, bin_dir, extract, install_with, read_capped, sha256_hex};
+    use super::{Fetch, InstallError, Limits, bin_dir, extract, install_with, random_suffix, read_capped, sha256_hex};
     use crate::platform::{Host, Plan};
     use crate::train::{Platform, Train};
 
@@ -665,7 +724,7 @@ sha256 = "{}"
         let (train, fetch, _, _) = fixture("", "");
         let bin = tempfile::tempdir().unwrap();
         std::fs::write(bin.path().join("alpha"), "alpha 1").unwrap();
-        let installed = install_with(&linux_plan(&train), &fetch, bin.path(), SMALL).unwrap();
+        let installed = install_with(&linux_plan(&train), &fetch, bin.path(), SMALL, &mut random_suffix).unwrap();
         assert_eq!(installed.len(), 2);
         assert_eq!(installed[0].path, bin.path().join("alpha"));
         assert_eq!(entries(bin.path()), ["alpha", "beta"]);
@@ -683,7 +742,7 @@ sha256 = "{}"
         let (train, fetch, _, _) = fixture("", "");
         let home = tempfile::tempdir().unwrap();
         let bin = home.path().join("cargo").join("bin");
-        install_with(&linux_plan(&train), &fetch, &bin, SMALL).unwrap();
+        install_with(&linux_plan(&train), &fetch, &bin, SMALL, &mut random_suffix).unwrap();
         assert_eq!(entries(&bin), ["alpha", "beta"]);
     }
 
@@ -693,7 +752,7 @@ sha256 = "{}"
         let (train, fetch, _, beta) = fixture("", &wrong);
         let home = tempfile::tempdir().unwrap();
         let bin = home.path().join("bin");
-        let err = install_with(&linux_plan(&train), &fetch, &bin, SMALL).unwrap_err();
+        let err = install_with(&linux_plan(&train), &fetch, &bin, SMALL, &mut random_suffix).unwrap_err();
         assert_eq!(
             err.to_string(),
             format!(
@@ -705,30 +764,74 @@ sha256 = "{}"
         assert!(!bin.exists(), "the bin directory was created");
     }
 
+    /// The temporary name `stage` gives `binary` with `suffix`.
+    fn temp_name(binary: &str, suffix: u64) -> String {
+        format!(".{binary}.sltk-{}-{suffix:016x}.tmp", std::process::id())
+    }
+
     #[test]
-    fn a_failed_rename_keeps_the_old_binary_and_leaves_no_temporary_file() {
+    fn a_failed_rename_leaves_earlier_tools_installed_and_names_them() {
         let (train, fetch, _, _) = fixture("", "");
         let bin = tempfile::tempdir().unwrap();
         std::fs::write(bin.path().join("alpha"), "alpha 1").unwrap();
         // A non-empty directory where beta goes makes its rename fail.
         std::fs::create_dir_all(bin.path().join("beta").join("keep")).unwrap();
-        let err = install_with(&linux_plan(&train), &fetch, bin.path(), SMALL).unwrap_err();
-        assert!(matches!(err, InstallError::Io { .. }), "{err:?}");
+        let err = install_with(&linux_plan(&train), &fetch, bin.path(), SMALL, &mut random_suffix).unwrap_err();
+        let InstallError::Partial { source, .. } = &err else { panic!("{err:?}") };
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "sltk: {}: {source}\n  the install is partial: alpha replaced, the rest left as they were",
+                bin.path().join("beta").display()
+            )
+        );
         assert_eq!(entries(bin.path()), ["alpha", "beta"]);
+        assert_eq!(std::fs::read(bin.path().join("alpha")).unwrap(), b"alpha 2");
         assert!(bin.path().join("beta").join("keep").is_dir());
     }
 
     #[test]
-    fn a_failed_stage_writes_nothing() {
+    fn a_failed_first_rename_is_not_partial() {
+        let (train, fetch, _, _) = fixture("", "");
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(bin.path().join("alpha").join("keep")).unwrap();
+        let err = install_with(&linux_plan(&train), &fetch, bin.path(), SMALL, &mut random_suffix).unwrap_err();
+        assert!(matches!(err, InstallError::Io { .. }), "{err:?}");
+        assert_eq!(entries(bin.path()), ["alpha"]);
+    }
+
+    #[test]
+    fn a_taken_temporary_name_is_left_alone_and_the_next_one_used() {
+        let (train, fetch, _, _) = fixture("", "");
+        let bin = tempfile::tempdir().unwrap();
+        let old = format!(".alpha.sltk-{}.tmp", std::process::id());
+        let taken = temp_name("alpha", 1);
+        std::fs::write(bin.path().join(&old), "not ours").unwrap();
+        std::fs::write(bin.path().join(&taken), "not ours either").unwrap();
+        let mut next = 0;
+        let mut suffix = || {
+            next += 1;
+            next
+        };
+        install_with(&linux_plan(&train), &fetch, bin.path(), SMALL, &mut suffix).unwrap();
+        assert_eq!(entries(bin.path()), [taken.as_str(), old.as_str(), "alpha", "beta"]);
+        assert_eq!(std::fs::read(bin.path().join(&old)).unwrap(), b"not ours");
+        assert_eq!(std::fs::read(bin.path().join(&taken)).unwrap(), b"not ours either");
+        assert_eq!(std::fs::read(bin.path().join("alpha")).unwrap(), b"alpha 2");
+    }
+
+    #[test]
+    fn a_failed_stage_writes_nothing_and_keeps_what_it_did_not_create() {
         let (train, fetch, _, _) = fixture("", "");
         let bin = tempfile::tempdir().unwrap();
         std::fs::write(bin.path().join("alpha"), "alpha 1").unwrap();
-        // A file where beta's temporary file goes makes its stage fail.
-        let blocker = format!(".beta.sltk-{}.tmp", std::process::id());
-        std::fs::create_dir(bin.path().join(&blocker)).unwrap();
-        let err = install_with(&linux_plan(&train), &fetch, bin.path(), SMALL).unwrap_err();
+        // With one suffix every try, beta's temporary name is always taken.
+        let blocker = temp_name("beta", 7);
+        std::fs::write(bin.path().join(&blocker), "not ours").unwrap();
+        let err = install_with(&linux_plan(&train), &fetch, bin.path(), SMALL, &mut || 7).unwrap_err();
         assert!(matches!(err, InstallError::Io { .. }), "{err:?}");
         assert_eq!(entries(bin.path()), [blocker.as_str(), "alpha"]);
+        assert_eq!(std::fs::read(bin.path().join(&blocker)).unwrap(), b"not ours");
         assert_eq!(std::fs::read(bin.path().join("alpha")).unwrap(), b"alpha 1");
     }
 
@@ -742,7 +845,7 @@ sha256 = "{}"
             big,
         )]);
         let bin = tempfile::tempdir().unwrap();
-        let err = install_with(&linux_plan(&train), &fetch, bin.path(), SMALL).unwrap_err();
+        let err = install_with(&linux_plan(&train), &fetch, bin.path(), SMALL, &mut random_suffix).unwrap_err();
         assert_eq!(
             err.to_string(),
             "sltk: the archive of alpha is larger than 1048576 bytes"
@@ -753,7 +856,14 @@ sha256 = "{}"
     fn a_failed_download_names_the_tool_and_url() {
         let (train, _, _, _) = fixture("", "");
         let bin = tempfile::tempdir().unwrap();
-        let err = install_with(&linux_plan(&train), &MapFetch(vec![]), bin.path(), SMALL).unwrap_err();
+        let err = install_with(
+            &linux_plan(&train),
+            &MapFetch(vec![]),
+            bin.path(),
+            SMALL,
+            &mut random_suffix,
+        )
+        .unwrap_err();
         assert_eq!(
             err.to_string(),
             "sltk: could not download alpha from https://fixture.test/2.0.0/alpha-x86_64-unknown-linux-gnu.tar.xz: \
@@ -767,7 +877,7 @@ sha256 = "{}"
         let (train, fetch, _, _) = fixture("", "");
         let plan = Plan::new(&train, Host::Supported(Platform::AppleSilicon), &[]).unwrap();
         let bin = tempfile::tempdir().unwrap();
-        let err = install_with(&plan, &fetch, bin.path(), SMALL).unwrap_err();
+        let err = install_with(&plan, &fetch, bin.path(), SMALL, &mut random_suffix).unwrap_err();
         assert!(matches!(err, InstallError::Incomplete { .. }), "{err:?}");
         assert!(entries(bin.path()).is_empty());
     }
