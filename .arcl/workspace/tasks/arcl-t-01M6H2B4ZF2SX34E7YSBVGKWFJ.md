@@ -2,10 +2,11 @@
 id = "arcl-t-01M6H2B4ZF2SX34E7YSBVGKWFJ"
 parent = "arcl-t-01M6H2B4X9KF5M9GWPPJ3CJ2ZQ"
 title = "Install tools from pinned release archives"
-status = "in_progress"
+status = "completed"
 priority = "normal"
 position = 2
 blocked-by = ["arcl-t-01M6H2B4YXHTGS3010SYPPVR95"]
+evidence = "Done in #11 at c213bf8: sltk install --yes downloads each archive into memory, checks the train's sha256, extracts only the binary and renames it into CARGO_HOME/bin; --with adds optional tools; local HTTP fixture tests cover good and bad hashes; a real run installed fab 0.8.0 and arcl 0.3.0."
 +++
 
 dist publishes a sha256 for each archive but
