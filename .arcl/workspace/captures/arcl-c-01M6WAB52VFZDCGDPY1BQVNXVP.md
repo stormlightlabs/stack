@@ -1,7 +1,7 @@
 +++
 id = "arcl-c-01M6WAB52VFZDCGDPY1BQVNXVP"
 title = "Make sltk releases downloadable without a token"
-status = "captured"
+status = "discarded"
 created-at = "2026-11-08T00:53:41.595Z"
 +++
 

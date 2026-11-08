@@ -15,12 +15,16 @@ Repositories need one command to follow it.
 
 `sltk update` writes this binary's train
 version into the pin, with the sha256 of each
-`sltk` archive copied from the `.sha256` files
+`sltk` archive read from the `.sha256` files
 on that release, runs `fab update`, then the
 glue writers, and shows the diff first as
 adoption does. It refuses to move to an older
-train. In a test, after `sltk update` and
-`sltk install --yes`, `sltk check` passes.
+train. The hashes come through a hash source
+the tests replace with a fixture. In a test,
+after `sltk update` and `sltk install --yes`,
+`sltk check` passes and the pin holds the
+fixture's hashes. `Smoke-test train changes
+in CI` covers reading a real release.
 
 ## Not in this task
 

@@ -47,6 +47,9 @@ it.
   their `rustfmt.toml`, rustdoc on exported items, cargo-dist releases with
   shell and Homebrew installers, conventional-commit PR titles, and the
   Apache-2.0 license.
+- `stormlightlabs/stack` is public from 0.1.0, so the session hook, the
+  Homebrew formula and the README's install line fetch release assets without
+  a token. The owner makes it public before the 0.1.0 cut.
 
 ### Tools and tiers
 
@@ -79,9 +82,11 @@ it.
   the release the train pins, checks it against the sha256 the train pins, and
   unpacks the binary into `~/.cargo/bin`. It does not run dist's installer
   script: dist publishes a sha256 for each archive but none for the script.
-- A train pull request copies each archive's sha256 from the `.sha256` file
-  dist publishes beside it. Pinning the hash in `train.toml` also catches an
-  asset uploaded again after the train was tested.
+- The pinned-hash rule: an archive installs only when it matches a sha256
+  pinned before the download. A train pull request copies each archive's
+  sha256 from the `.sha256` file dist publishes beside it. Pinning the hash in
+  `train.toml` also catches an asset uploaded again after the train was
+  tested.
 - A machine holds one version of each tool. `sltk check` reports when a
   repository's pin differs from what is installed.
 - Tools come from their GitHub releases, never from Homebrew: the tap holds
@@ -93,8 +98,9 @@ it.
 
 ### Repository setup
 
-- A repository records its pin in `.github/sltk.toml`: the train version and
-  the optional tools it chose. The essentials are implied.
+- A repository records its pin in `.github/sltk.toml`: the train version, the
+  sha256 of each `sltk` archive and the optional tools it chose. The
+  essentials are implied.
 - `sltk init` runs each tool's own setup: `fab init`, `arcl init --workspace`
   and `arcl skill install`. `fab init` requires `--owner`, `--trailer` and
   `--gates`, so on a fresh repository `sltk init` takes the same three flags,
@@ -120,16 +126,17 @@ it.
   `sha256-x86_64-unknown-linux-gnu = "<hex>"`, copied from the `.sha256` files
   on the `sltk` release they pin. The hook maps `uname -sm` to its target,
   reads that line, and fails when the line is missing or the hash differs.
-  This is the train's rule applied to `sltk` itself: an archive uploaded again
-  after the pin fails the check, and a new version and its hashes are one diff
-  in one file.
+  It hashes with `sha256sum`, or `shasum -a 256` where that is missing, and
+  fails naming both when neither is installed; dist's installer skips the
+  check then. This is the pinned-hash rule applied to `sltk` itself: an
+  archive uploaded again after the pin fails the check, and a new version and
+  its hashes are one diff in one file.
 - The other ways to check were weaker or cost more. The `.sha256` file beside
   the archive comes from the same release, so it catches a broken download
   but not a replaced one. dist's installer script checks the archive against
   a hash written into the script, but nothing checks the script. GitHub
-  artifact attestations need `gh` in the session, dist's experimental
-  `github-attestations` setting, and a public repository or GitHub
-  Enterprise.
+  artifact attestations need `gh` in the session to verify, and dist's
+  `github-attestations` setting, which is experimental.
 - `sltk init` adopts a repository that is already set up. It keeps the
   settings in `.github/fabrial.toml` and runs `fab update`, replaces a copied
   `session-start.sh`, and rewrites the Tasks section in place. It runs
@@ -194,23 +201,20 @@ it.
   nothing and exits 4 when a file is missing or differs.
 - `fab init --help` in fab 0.8.0: `--owner`, `--trailer` and `--gates` are
   required.
-- The assets of arcl's v0.3.0 release: a `.sha256` file beside each archive,
-  none beside `arcl-cli-installer.sh`, and a `sha256.sum` that lists no
-  installer.
 - The GitHub releases API for fab's v0.8.0 and arcl's v0.3.0, checked
   2026-11-08: each archive has a `.sha256` file beside it; neither installer
-  script has one. fab's archive hashes match the `.sha256` files and
-  `train.toml`.
+  script has one, and arcl's `sha256.sum` lists no installer. fab's archive
+  hashes match the `.sha256` files and `train.toml`.
 - cargo-dist 0.32.0's `installer.sh.j2`: the script carries each archive's
   sha256 and checks it with `sha256sum`, skipping the check when `sha256sum`
-  is missing.
+  is missing (line 1449).
 - cargo-dist 0.32.0's config reference and attestations guide:
   `github-attestations` is experimental and off by default, it adds an
   `actions/attest` step to `release.yml`, verification goes through
-  `gh attestation verify`, and it supports public repositories and
-  organization repositories on GitHub Enterprise.
+  `gh attestation verify`.
 - The GitHub API for `stormlightlabs/stack`, checked 2026-11-08: the
-  repository is private and has no releases yet.
+  repository is private and has no releases yet. The owner decided the same
+  day to make it public before the 0.1.0 cut.
 - `.github/fabrial.toml` in each repository: the fab version each pins.
 - The prototype session hook in PR #4: it read arcl 0.3.0 from a test
   `sltk.toml` with the shell one-liner and installed it in a Claude cloud

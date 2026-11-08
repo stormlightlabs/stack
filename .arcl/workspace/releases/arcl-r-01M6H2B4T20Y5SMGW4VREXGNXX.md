@@ -14,6 +14,10 @@ id = "arcl-t-01M6H2B4X9KF5M9GWPPJ3CJ2ZQ"
 [[members]]
 kind = "task"
 id = "arcl-t-01M6H2NG78Y0HHARS9S0F0MFTE"
+
+[[members]]
+kind = "task"
+id = "arcl-t-01M6WAN3NKQNXYBQKG4X8ZRQV8"
 +++
 
 The `v0.1: workspace and machine install` phase of the storm stack plan.

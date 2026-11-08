@@ -20,21 +20,27 @@ session-start.sh` and its entry in
 `.claude/settings.json`, as the spike decided.
 Running it twice changes nothing the second
 time. `sltk init` writes the sha256 of each
-`sltk` archive into the pin, copied from the
+`sltk` archive into the pin, read from the
 `.sha256` files on the release of the version
-it pins. The hook downloads the
+it pins through a hash source the tests
+replace with a fixture. The hook downloads the
 `sltk-cli-<target>.tar.xz` archive for the
 target `uname -sm` names, checks it against
 that target's `sha256-<target>` line in
 `.github/sltk.toml` and never runs dist's
 installer script. It fails when the line is
-missing or the hash differs. Then it runs
-`sltk install --yes` and builds the arcl
-cache. A test runs the written hook with a
-locally built `sltk` archive in place of the
-download and finds arcl installed, and a
-second test finds that an archive with another
-hash fails the hook.
+missing or the hash differs. It hashes with
+`sha256sum`, or `shasum -a 256` where that is
+missing, and fails naming both when neither
+is on `PATH`. Then it runs `sltk install
+--yes` and builds the arcl cache. A test runs
+the written hook with a locally built `sltk`
+archive in place of the download and finds
+arcl installed. Further tests find that the
+hook fails on an archive with another hash
+and with neither hashing tool on `PATH`.
+`Smoke-test train changes in CI` covers
+reading a real release.
 
 ## Not in this task
 
