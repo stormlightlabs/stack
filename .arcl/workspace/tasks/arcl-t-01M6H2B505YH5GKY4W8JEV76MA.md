@@ -2,7 +2,7 @@
 id = "arcl-t-01M6H2B505YH5GKY4W8JEV76MA"
 parent = "arcl-t-01M6H2B4X9KF5M9GWPPJ3CJ2ZQ"
 title = "Pick optional tools on a terminal"
-status = "pending"
+status = "in_progress"
 priority = "normal"
 position = 3
 blocked-by = ["arcl-t-01M6H2B4ZF2SX34E7YSBVGKWFJ"]
