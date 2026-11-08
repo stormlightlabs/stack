@@ -2,10 +2,11 @@
 id = "arcl-t-01M6H2B546VDAZG9A2RKMMQK00"
 parent = "arcl-t-01M6H2B51T9ZV42EXGEQ7GQV5X"
 title = "Run fab init and arcl setup from sltk init"
-status = "in_progress"
+status = "completed"
 priority = "normal"
 position = 2
 blocked-by = ["arcl-t-01M6H2B4ZF2SX34E7YSBVGKWFJ", "arcl-t-01M6H2B53NKD1JFH0BCHTW0EA2"]
+evidence = "Done in #13: sltk init takes --owner, --trailer and --gates (asking on a terminal), resolves fab and arcl to absolute paths, runs fab init, arcl init --workspace and arcl skill install in the repo root, and writes the pin only after all succeed; fake-PATH tests check calls, arguments, reruns and refusals."
 +++
 
 `fab init` needs `--owner`, `--trailer` and
