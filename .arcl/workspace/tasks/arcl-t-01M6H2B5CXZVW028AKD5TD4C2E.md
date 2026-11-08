@@ -5,7 +5,7 @@ title = "Smoke-test train changes in CI"
 status = "pending"
 priority = "normal"
 position = 2
-blocked-by = ["arcl-t-01M6H2B5BP5M44YGAEQAARYBR8"]
+blocked-by = ["arcl-t-01M6H2B5BP5M44YGAEQAARYBR8", "arcl-t-01M6J62CDRJY6YQR5NEZG913RR"]
 +++
 
 The spec gates each train PR on an install,

@@ -19,7 +19,8 @@ installs the essentials without prompting. On a
 terminal with no `--with` or `--yes`, it shows a
 picker with fab and arcl fixed and mire
 unticked. Tests drive the choice logic through
-a fake terminal.
+a fake terminal and a fixture train that lists
+mire.
 
 ## Not in this task
 
