@@ -2,7 +2,7 @@
 id = "arcl-t-01M6H2B53NKD1JFH0BCHTW0EA2"
 parent = "arcl-t-01M6H2B51T9ZV42EXGEQ7GQV5X"
 title = "Read and write the repository pin"
-status = "pending"
+status = "in_progress"
 priority = "normal"
 position = 1
 blocked-by = ["arcl-t-01M6H2B4YC747EJDDWRBYHDFH5"]
