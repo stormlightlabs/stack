@@ -2,7 +2,7 @@
 id = "arcl-t-01M6H2B4YXHTGS3010SYPPVR95"
 parent = "arcl-t-01M6H2B4X9KF5M9GWPPJ3CJ2ZQ"
 title = "Detect the platform and name what it cannot install"
-status = "pending"
+status = "in_progress"
 priority = "normal"
 position = 1
 blocked-by = ["arcl-t-01M6H2B4YC747EJDDWRBYHDFH5"]
