@@ -2,9 +2,10 @@
 id = "arcl-t-01M6H4C5Z4PQ6WKD582Y05H1KJ"
 parent = "arcl-t-01M6H2B51T9ZV42EXGEQ7GQV5X"
 title = "Decide how the session hook verifies the sltk download"
-status = "pending"
+status = "completed"
 priority = "normal"
 position = 0
+evidence = "Done in #10 at e735885: the hook downloads the sltk archive and checks it against a sha256 per platform pinned in .github/sltk.toml, written by sltk init and update; the hook fails without sha256sum or shasum; stack goes public before 0.1.0."
 +++
 
 The session hook installs `sltk` before `sltk`
