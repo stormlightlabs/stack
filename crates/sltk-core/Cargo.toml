@@ -5,9 +5,16 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "The release train and the release number sltk reports"
+description = "The release train, the install plan and the install of each tool"
 
 [dependencies]
+lzma-rs.workspace = true
 serde.workspace = true
+sha2.workspace = true
+tar.workspace = true
 thiserror.workspace = true
 toml.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -11,9 +11,14 @@ homepage = "https://github.com/stormlightlabs/stack"
 
 [workspace.dependencies]
 clap = { version = "4.6", features = ["derive"] }
+lzma-rs = "0.3"
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.11"
+tar = { version = "0.4.46", default-features = false }
+tempfile = "3.27"
 thiserror = "2"
 toml = "1.1"
+ureq = { version = "3.5", default-features = false, features = ["rustls", "platform-verifier"] }
 
 [profile.dist]
 inherits = "release"
