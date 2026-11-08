@@ -47,11 +47,11 @@ enum Command {
     /// prints what it will install, and on a terminal without --yes it then
     /// asks before installing, and exits 3 if the answer is no. Off a
     /// terminal, where stdin or stdout is not one, it asks nothing and
-    /// installs fab, arcl and the --with tools. Exits 0 once every tool is installed. Exits 1 when it wrote
-    /// nothing: a tool has no archive for this machine, a --with name is
-    /// wrong, or a download, hash check or write fails. Exits 4 when it
-    /// replaced some tools and then failed, leaving the rest as they were;
-    /// the error names the tools it replaced.
+    /// installs fab, arcl and the --with tools. Exits 0 once every tool is
+    /// installed. Exits 1 when it wrote nothing: a tool has no archive for
+    /// this machine, a --with name is wrong, or a download, hash check or
+    /// write fails. Exits 4 when it replaced some tools and then failed,
+    /// leaving the rest as they were; the error names the tools it replaced.
     Install {
         /// Install without asking. Off a terminal sltk never asks.
         #[arg(long)]
@@ -165,8 +165,8 @@ fn should_install(yes: bool, terminal: bool, input: &mut impl BufRead, output: &
 
 /// Runs `sltk install`: settles the tools with [`optional_tools`], writes the
 /// plan to `output`, then installs it when [`should_install`] says to,
-/// reading any answer from `input`. Returns the
-/// exit code, or the exit code and the error to print.
+/// reading any answer from `input`. Returns the exit code, or the exit code
+/// and the error to print.
 fn run_install(
     train: &Train, choices: Choices, input: &mut impl BufRead, output: &mut impl Write,
 ) -> Result<u8, (u8, String)> {
@@ -379,13 +379,15 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
     }
 
     /// Answering no on a terminal prints the plan and the declined line, and
-    /// exits 3 before any download.
+    /// exits 3 before any download. The train has no optional tool, so the
+    /// confirmation is the only question.
     #[test]
     fn a_declined_install_exits_3_and_downloads_nothing() {
         if Host::detect().platform().is_none() {
             return;
         }
-        let train = Train::embedded().unwrap();
+        let mut train = Train::parse(STACK).unwrap();
+        train.tools.retain(|tool| tool.tier == Tier::Essential);
         let choices = Choices { yes: false, terminal: true, with: &[] };
         let mut output = Vec::new();
         let code = run_install(&train, choices, &mut "no\n".as_bytes(), &mut output).unwrap();

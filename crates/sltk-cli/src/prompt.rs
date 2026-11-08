@@ -36,8 +36,8 @@ pub fn confirm(input: &mut impl BufRead, output: &mut impl Write, question: &str
 
 /// Lists the `essential` tools as always installed and each `optional` tool
 /// numbered and unticked, then reads one line naming the optional tools to
-/// add, by number or name, separated by spaces or commas. Returns the chosen
-/// names in `optional` order.
+/// add, by number or name in any case, separated by spaces or commas. Returns
+/// the chosen names as `optional` spells them, in `optional` order.
 ///
 /// Enter chooses none. An answer naming anything else asks again, up to
 /// [`ASKS`] times in all, and then counts as none. End of input counts as
@@ -77,7 +77,7 @@ fn chosen(line: &str, optional: &[&str]) -> Result<Vec<String>, String> {
     {
         let index = match word.parse::<usize>() {
             Ok(number) => number.checked_sub(1).filter(|&index| index < optional.len()),
-            Err(_) => optional.iter().position(|name| *name == word),
+            Err(_) => optional.iter().position(|name| name.eq_ignore_ascii_case(word)),
         };
         match index {
             Some(index) => ticked[index] = true,
@@ -160,6 +160,12 @@ mod tests {
         assert_eq!(picked("dalil\n").0, ["dalil"]);
         assert_eq!(picked("dalil, 1\n").0, ["mire", "dalil"]);
         assert_eq!(picked(" 2 2 dalil \n").0, ["dalil"]);
+    }
+
+    #[test]
+    fn names_match_in_any_case_and_come_back_as_listed() {
+        assert_eq!(picked("MIRE\n").0, ["mire"]);
+        assert_eq!(picked("Dalil, mIrE\n").0, ["mire", "dalil"]);
     }
 
     #[test]
