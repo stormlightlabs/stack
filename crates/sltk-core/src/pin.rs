@@ -23,6 +23,9 @@ pub const PATH: &str = ".github/sltk.toml";
 /// the file lists them.
 pub const TARGETS: [Platform; 2] = [Platform::AppleSilicon, Platform::LinuxX86_64];
 
+/// The longest version the pin accepts, in bytes.
+const MAX_VERSION_LEN: usize = 32;
+
 /// The comment at the top of a written pin.
 const HEADER: &str = "# The sltk release this repository pins, and the optional tools it uses.\n\
 # The session hook reads the version and sha256 lines; sltk writes them, so keep them as is.\n";
@@ -62,9 +65,9 @@ pub enum PinError {
     /// The sha256 is not 64 lowercase hexadecimal digits.
     #[error("{PATH}: the sha256 for {platform} is not 64 lowercase hexadecimal digits")]
     BadHash { platform: Platform },
-    /// The version has a character other than a digit or `.`, or does not
-    /// start with a digit, so the session hook could not read it.
-    #[error("{PATH}: the version {version:?} is not digits and dots")]
+    /// The version is not `x.y.z`: three runs of digits joined by dots, each
+    /// without a leading zero unless it is `0`, at most 32 bytes in all.
+    #[error("{PATH}: the version {version:?} is not x.y.z")]
     BadVersion { version: String },
     /// The train has no tool by this name.
     #[error("{PATH}: the train has no tool named {tool}")]
@@ -99,14 +102,26 @@ impl Pin {
     }
 
     /// Writes the pin to `.github/sltk.toml` under `root`, creating `.github`
-    /// when it is missing.
+    /// when it is missing. The text goes to a temporary file in `.github`
+    /// that is synced and then renamed over the pin, so a failed write leaves
+    /// the old pin whole. On failure the temporary file is removed, and so is
+    /// `.github` when this call created it and it is empty.
     pub fn write(&self, root: &Path, train: &Train) -> Result<(), PinError> {
         let text = self.render(train)?;
         let path = root.join(PATH);
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|source| PinError::Io { path: dir.to_owned(), source })?;
+        let dir = path.parent().expect("PATH has a parent");
+        let created = !dir.exists();
+        std::fs::create_dir_all(dir).map_err(|source| PinError::Io { path: dir.to_owned(), source })?;
+        let temp = dir.join(format!(".sltk.toml.{}.tmp", std::process::id()));
+        let result = replace(&temp, &path, text.as_bytes());
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+            if created {
+                // Fails, and so keeps the directory, unless it is empty.
+                let _ = std::fs::remove_dir(dir);
+            }
         }
-        std::fs::write(&path, text).map_err(|source| PinError::Io { path, source })
+        result
     }
 
     /// Reads a pin from the text of a `.github/sltk.toml`. The text must hold
@@ -200,6 +215,25 @@ struct RawPin {
     sha256: BTreeMap<String, String>,
 }
 
+/// Writes `bytes` to a new file at `temp`, syncs it, and renames it over
+/// `path`. `temp` must be in the same directory as `path`, so the rename is
+/// atomic.
+fn replace(temp: &Path, path: &Path, bytes: &[u8]) -> Result<(), PinError> {
+    use std::io::Write;
+    fn io_err(path: &Path) -> impl FnOnce(io::Error) -> PinError + '_ {
+        move |source| PinError::Io { path: path.to_owned(), source }
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp)
+        .map_err(io_err(temp))?;
+    file.write_all(bytes).map_err(io_err(temp))?;
+    file.sync_all().map_err(io_err(temp))?;
+    drop(file);
+    std::fs::rename(temp, path).map_err(io_err(path))
+}
+
 /// The key of the line that holds the hash for `platform`.
 fn hash_key(platform: Platform) -> String {
     format!("sha256-{platform}")
@@ -220,9 +254,15 @@ fn is_hash(hash: &str) -> bool {
     hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Whether `version` matches the one-liner's `[0-9][0-9.]*`.
+/// Whether `version` is `x.y.z`: three runs of ASCII digits joined by dots,
+/// each without a leading zero unless it is `0`, at most [`MAX_VERSION_LEN`]
+/// bytes in all. Every such version also matches the one-liner's
+/// `[0-9][0-9.]*`, which only extracts.
 fn is_hook_version(version: &str) -> bool {
-    version.starts_with(|c: char| c.is_ascii_digit()) && version.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+    let run = |part: &str| {
+        !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) && (part == "0" || !part.starts_with('0'))
+    };
+    version.len() <= MAX_VERSION_LEN && version.split('.').count() == 3 && version.split('.').all(run)
 }
 
 #[cfg(test)]
@@ -337,12 +377,46 @@ sha256 = "{HASH}"
     #[test]
     fn write_then_read_round_trips_through_the_file() {
         let train = fixture_train();
-        let root = std::env::temp_dir().join(format!("sltk-pin-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = scratch("round-trip");
         pin(&["mire"]).write(&root, &train).unwrap();
         assert!(root.join(PATH).is_file());
         assert_eq!(Pin::read(&root, &train).unwrap(), pin(&["mire"]));
+
+        // A second write replaces the pin and leaves only it in `.github`.
+        pin(&[]).write(&root, &train).unwrap();
+        assert_eq!(Pin::read(&root, &train).unwrap(), pin(&[]));
+        assert_eq!(entries(&root.join(".github")), ["sltk.toml"]);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_temporary_file() {
+        let train = fixture_train();
+        let root = scratch("failed-write");
+        // A directory where the pin goes makes the rename fail.
+        std::fs::create_dir_all(root.join(PATH).join("keep")).unwrap();
+        let err = pin(&[]).write(&root, &train).unwrap_err();
+        assert!(matches!(err, PinError::Io { .. }), "{err:?}");
+        assert_eq!(entries(&root.join(".github")), ["sltk.toml"]);
+        assert!(root.join(PATH).join("keep").is_dir());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// An empty directory for one test, under the system temporary directory.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("sltk-pin-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    /// The names in `dir`, sorted.
+    fn entries(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
     }
 
     #[test]
@@ -389,10 +463,42 @@ sha256 = "{HASH}"
     #[test]
     fn a_version_the_hook_cannot_read_is_not_written() {
         let train = fixture_train();
-        for version in ["", "v0.1.0", "0.1.0-rc.1", "0.1.0\"\nx = \"1"] {
+        let long = "1".repeat(5000);
+        let just_over = format!("1.0.{}", "1".repeat(29));
+        let unreadable = [
+            "",
+            "v0.1.0",
+            "0.1.0-rc.1",
+            "1..",
+            "0",
+            "0.1",
+            "0.1.0.0",
+            "01.2.3",
+            "1.02.3",
+            "1.2.",
+            &long,
+            &just_over,
+        ];
+        for version in unreadable.iter().copied().chain(["0.1.0\"\nx = \"1"]) {
             let written = Pin { version: version.to_owned(), ..pin(&[]) };
             let err = written.render(&train).unwrap_err();
             assert!(matches!(err, PinError::BadVersion { .. }), "{version:?}: {err:?}");
+        }
+        for version in unreadable {
+            let text = format!("version = \"{version}\"\n{}", hash_lines());
+            let err = Pin::parse(&text, &train).unwrap_err();
+            assert!(matches!(err, PinError::MissingVersionLine), "{version:?}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn a_version_of_three_digit_runs_is_written_and_read() {
+        let train = fixture_train();
+        let longest = format!("1.0.{}", "1".repeat(28));
+        for version in ["0.0.0", "10.20.30", "0.1.0", &longest] {
+            let written = Pin { version: version.to_owned(), ..pin(&[]) };
+            let read = Pin::parse(&written.render(&train).unwrap(), &train).unwrap();
+            assert_eq!(read, written, "{version:?}");
         }
     }
 
