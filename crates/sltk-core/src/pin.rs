@@ -44,6 +44,18 @@ pub enum PinError {
     /// the session hook could not check the archive.
     #[error("{PATH}: no line reads exactly sha256-{platform} = \"<hex>\", which the session hook needs")]
     MissingHashLine { platform: Platform },
+    /// The `version = "x.y.z"` line the session hook reads and the TOML
+    /// version differ, as when the line sits inside a string.
+    #[error("{PATH}: the version line and the TOML version differ")]
+    VersionMismatch,
+    /// The `sha256-<target> = "<hex>"` line the session hook reads and the
+    /// TOML hash for this platform differ, as when the line sits inside a
+    /// string.
+    #[error("{PATH}: the sha256-{platform} line and the TOML hash differ")]
+    HashMismatch { platform: Platform },
+    /// The pin has a key it does not define.
+    #[error("{PATH}: unknown key {key}")]
+    UnknownKey { key: String },
     /// The pin has no sha256 for this platform.
     #[error("{PATH}: the pin has no sha256 for {platform}")]
     MissingHash { platform: Platform },
@@ -107,19 +119,20 @@ impl Pin {
             let hash = hook_line(text, &hash_key(platform), is_hash).ok_or(PinError::MissingHashLine { platform })?;
             line_hashes.insert(platform, hash);
         }
-        let raw: RawPin = toml::from_str(text)?;
+        let mut raw: RawPin = toml::from_str(text)?;
         if raw.version != line_version {
-            return Err(PinError::MissingVersionLine);
+            return Err(PinError::VersionMismatch);
         }
         let mut sha256 = BTreeMap::new();
-        for (platform, hash) in [
-            (Platform::AppleSilicon, raw.sha256_aarch64_apple_darwin),
-            (Platform::LinuxX86_64, raw.sha256_x86_64_unknown_linux_gnu),
-        ] {
-            if line_hashes.get(&platform) != Some(&hash.as_str()) {
-                return Err(PinError::MissingHashLine { platform });
+        for platform in TARGETS {
+            let hash = raw.sha256.remove(&hash_key(platform));
+            if hash.as_deref() != line_hashes.get(&platform).copied() {
+                return Err(PinError::HashMismatch { platform });
             }
-            sha256.insert(platform, hash);
+            sha256.extend(hash.map(|hash| (platform, hash)));
+        }
+        if let Some(key) = raw.sha256.into_keys().next() {
+            return Err(PinError::UnknownKey { key });
         }
         let pin = Pin { version: raw.version, sha256, optional: raw.optional };
         pin.check(train)?;
@@ -174,17 +187,17 @@ impl Pin {
     }
 }
 
-/// `.github/sltk.toml` as written.
+/// `.github/sltk.toml` as written. serde cannot deny unknown fields next to
+/// a flattened map, so every key other than `version` and `optional` lands in
+/// `sha256`, and [`Pin::parse`] rejects any that is not a [`TARGETS`] hash key.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawPin {
     version: String,
-    #[serde(rename = "sha256-aarch64-apple-darwin")]
-    sha256_aarch64_apple_darwin: String,
-    #[serde(rename = "sha256-x86_64-unknown-linux-gnu")]
-    sha256_x86_64_unknown_linux_gnu: String,
     #[serde(default)]
     optional: Vec<String>,
+    /// The `sha256-<target>` values, by key.
+    #[serde(flatten)]
+    sha256: BTreeMap<String, String>,
 }
 
 /// The key of the line that holds the hash for `platform`.
@@ -260,25 +273,25 @@ sha256 = "{HASH}"
         format!("sha256-aarch64-apple-darwin = \"{DARWIN}\"\nsha256-x86_64-unknown-linux-gnu = \"{LINUX}\"\n")
     }
 
-    /// The session hook's one-liners, written out by hand apart from the
-    /// module's reader so a change to either shows here:
-    /// `sed -n 's/^version = "\([0-9][0-9.]*\)"$/\1/p'` when `key` is
-    /// `version`, and `sed -n 's/^<key> = "\([0-9a-f]\{64\}\)"$/\1/p'` for a
-    /// hash.
-    fn sed_one_liner<'a>(text: &'a str, key: &str) -> Vec<&'a str> {
-        let prefix = format!("{key} = \"");
-        text.split('\n')
-            .filter_map(|line| {
-                let value = line.strip_prefix(prefix.as_str())?.strip_suffix('"')?;
-                let ok = if key == "version" {
-                    let mut chars = value.chars();
-                    chars.next()?.is_ascii_digit() && chars.all(|c| c.is_ascii_digit() || c == '.')
-                } else {
-                    value.len() == 64 && value.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
-                };
-                ok.then_some(value)
-            })
-            .collect()
+    /// Runs the session hook's `sed -n` script on `text`, or returns `None`
+    /// when `sed` is not on the PATH.
+    fn sed(script: &str, text: &str) -> Option<String> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = match Command::new("sed")
+            .args(["-n", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(err) => panic!("sed: {err}"),
+        };
+        child.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "sed {script}: {out:?}");
+        Some(String::from_utf8(out.stdout).unwrap())
     }
 
     #[test]
@@ -293,9 +306,23 @@ sha256 = "{HASH}"
             assert!(lines.contains(&expected.as_str()), "{expected} not in\n{text}");
         }
         assert!(!lines.iter().any(|line| line.starts_with('[')), "a table in\n{text}");
-        assert_eq!(sed_one_liner(&text, "version"), ["0.1.0"]);
-        assert_eq!(sed_one_liner(&text, "sha256-aarch64-apple-darwin"), [DARWIN]);
-        assert_eq!(sed_one_liner(&text, "sha256-x86_64-unknown-linux-gnu"), [LINUX]);
+    }
+
+    #[test]
+    fn the_session_hook_sed_reads_the_written_version_and_hashes() {
+        let text = pin(&["mire"]).render(&fixture_train()).unwrap();
+        let hash = |target: &str| format!(r#"s/^sha256-{target} = "\([0-9a-f]\{{64\}}\)"$/\1/p"#);
+        for (script, expected) in [
+            (r#"s/^version = "\([0-9][0-9.]*\)"$/\1/p"#.to_owned(), "0.1.0"),
+            (hash("aarch64-apple-darwin"), DARWIN),
+            (hash("x86_64-unknown-linux-gnu"), LINUX),
+        ] {
+            let Some(out) = sed(&script, &text) else {
+                println!("skipped: sed is not on the PATH");
+                return;
+            };
+            assert_eq!(out, format!("{expected}\n"), "{script}");
+        }
     }
 
     #[test]
@@ -454,7 +481,11 @@ sha256 = "{HASH}"
             hash_lines()
         );
         let err = Pin::parse(&text, &fixture_train()).unwrap_err();
-        assert!(matches!(err, PinError::MissingVersionLine), "{err:?}");
+        assert!(matches!(err, PinError::VersionMismatch), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            ".github/sltk.toml: the version line and the TOML version differ"
+        );
     }
 
     #[test]
@@ -467,7 +498,24 @@ sha256 = "{HASH}"
         );
         let err = Pin::parse(&text, &fixture_train()).unwrap_err();
         assert!(
-            matches!(err, PinError::MissingHashLine { platform: Platform::LinuxX86_64 }),
+            matches!(err, PinError::HashMismatch { platform: Platform::LinuxX86_64 }),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            ".github/sltk.toml: the sha256-x86_64-unknown-linux-gnu line and the TOML hash differ"
+        );
+    }
+
+    #[test]
+    fn a_hash_line_inside_a_string_with_no_toml_hash_is_rejected() {
+        let text = format!(
+            "version = \"0.1.0\"\nsha256-aarch64-apple-darwin = \"{DARWIN}\"\n\
+             optional = [\"\"\"\nsha256-x86_64-unknown-linux-gnu = \"{LINUX}\"\n\"\"\"]\n"
+        );
+        let err = Pin::parse(&text, &fixture_train()).unwrap_err();
+        assert!(
+            matches!(err, PinError::HashMismatch { platform: Platform::LinuxX86_64 }),
             "{err:?}"
         );
     }
@@ -477,5 +525,11 @@ sha256 = "{HASH}"
         let text = format!("version = \"0.1.0\"\n{}extra = 1\n", hash_lines());
         let err = Pin::parse(&text, &fixture_train()).unwrap_err();
         assert!(matches!(err, PinError::Parse(_)), "{err:?}");
+
+        for key in ["extra", "sha256-x86_64-pc-windows-msvc"] {
+            let text = format!("version = \"0.1.0\"\n{}{key} = \"x\"\n", hash_lines());
+            let err = Pin::parse(&text, &fixture_train()).unwrap_err();
+            assert!(matches!(&err, PinError::UnknownKey { key: k } if k == key), "{err:?}");
+        }
     }
 }
