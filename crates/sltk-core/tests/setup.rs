@@ -1,10 +1,11 @@
 //! Runs `init` against fake `fab` and `arcl` scripts that record each call,
 //! with fixed archive hashes in place of a published release. The fake `fab`
 //! writes `.github/fabrial.toml` and refuses to run twice, as fab 0.8.0 does.
+//! The repository is a real git repository, where `init` records its run.
 
 #![cfg(unix)]
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -59,7 +60,7 @@ enum Skill {
 
 /// A fake tool and repository: a bin directory holding `fab` and `arcl`
 /// scripts that append their working directory and arguments, tab-separated,
-/// to `calls`, and an empty repository root.
+/// to `calls`, and an empty git repository.
 struct Fakes {
     _dir: tempfile::TempDir,
     bin: PathBuf,
@@ -74,7 +75,12 @@ impl Fakes {
         let bin = dir.path().join("bin");
         let root = dir.path().join("repo");
         std::fs::create_dir_all(&bin).unwrap();
-        std::fs::create_dir_all(&root).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
         let calls = dir.path().join("calls");
         // Builtins only: PATH holds nothing but the fakes.
         let record = format!(
@@ -112,16 +118,36 @@ impl Fakes {
     fn init_with(
         &self, settings: &FabSettings, with: &[String], hashes: &dyn HashSource,
     ) -> (Result<Pin, SetupError>, String) {
+        self.init_on(&OsString::from(&self.bin), settings, with, hashes)
+    }
+
+    /// Runs `init` with `settings` and `path` as `PATH`.
+    fn init_on(
+        &self, path: &OsStr, settings: &FabSettings, with: &[String], hashes: &dyn HashSource,
+    ) -> (Result<Pin, SetupError>, String) {
         let train = Train::embedded().unwrap();
-        let path = OsString::from(&self.bin);
         let mut output = Vec::new();
         let result = init(
             &train,
             "1.2.3",
-            Init { root: &self.root, settings, with, hashes, path: Some(&path) },
+            Init { root: &self.root, settings, with, hashes, path: Some(path) },
             &mut output,
         );
         (result, String::from_utf8(output).unwrap())
+    }
+
+    /// Where `init` records its run.
+    fn record(&self) -> PathBuf {
+        self.root.join(".git/sltk-init")
+    }
+
+    /// Writes fab's settings as fab `version` would for [`settings`].
+    fn write_fab_settings(&self, version: &str) {
+        std::fs::create_dir_all(self.root.join(".github")).unwrap();
+        let text = format!(
+            "owner = \"octo\"\ntrailer = \"Ada Lovelace <ada@example.com>\"\ngates = \"just check\"\nversion = \"{version}\"\n"
+        );
+        std::fs::write(self.root.join(FAB_SETTINGS), text).unwrap();
     }
 
     /// Each recorded call as its working directory and arguments.
@@ -187,6 +213,7 @@ fn init_runs_fab_then_arcl_in_the_root_and_writes_the_pin() {
     );
     assert!(text.ends_with("\noptional = []\n"), "{text}");
     assert_eq!(Pin::read(&fakes.root, &Train::embedded().unwrap()).unwrap(), pin);
+    assert!(!fakes.record().exists());
 }
 
 /// The `fab init` call the fakes record for [`settings`].
@@ -243,6 +270,13 @@ fn a_rerun_after_a_failure_skips_fab_init_and_finishes() {
     let (result, _) = fakes.init(&[], &Fixed);
     assert!(matches!(result, Err(SetupError::Failed { .. })), "{result:?}");
     assert!(!fakes.root.join(pin::PATH).exists());
+    let record = std::fs::read_to_string(fakes.record()).unwrap();
+    assert!(
+        record.ends_with(
+            "owner = \"octo\"\ntrailer = \"Ada Lovelace <ada@example.com>\"\ngates = \"just check\"\nfab = \"0.8.0\"\n"
+        ),
+        "{record}"
+    );
 
     let (result, output) = fakes.init(&[], &Fixed);
     let pin = result.unwrap();
@@ -264,6 +298,99 @@ fn a_rerun_after_a_failure_skips_fab_init_and_finishes() {
         ]
     );
     assert_eq!(Pin::read(&fakes.root, &Train::embedded().unwrap()).unwrap(), pin);
+    assert!(!fakes.record().exists());
+}
+
+#[test]
+fn matching_fab_settings_without_a_record_are_refused_before_any_download() {
+    let fakes = Fakes::new(Skill::Works);
+    fakes.write_fab_settings("0.8.0");
+    let (result, output) = fakes.init(&[], &Unread);
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.ends_with(
+            "/.github/fabrial.toml was not written by an earlier sltk init; \
+             sltk cannot adopt a repository set up by hand yet \
+             (planned in the stack task \"Adopt repositories set up by hand\")"
+        ),
+        "{err}"
+    );
+    assert!(output.is_empty());
+    assert!(fakes.calls().is_empty());
+    assert!(!fakes.record().exists());
+}
+
+#[test]
+fn fab_settings_from_another_fab_are_refused_even_with_a_record() {
+    let fakes = Fakes::new(Skill::FailsOnce);
+    let (result, _) = fakes.init(&[], &Fixed);
+    assert!(matches!(result, Err(SetupError::Failed { .. })), "{result:?}");
+    assert!(fakes.record().exists());
+    fakes.write_fab_settings("0.5.0");
+    let (result, _) = fakes.init(&[], &Unread);
+    assert!(
+        matches!(&result, Err(SetupError::FabInstalled { reason, .. })
+            if reason == "was written by fab 0.5.0, not by the train's fab 0.8.0"),
+        "{result:?}"
+    );
+    assert_eq!(fakes.calls().len(), 3);
+}
+
+#[test]
+fn oversize_or_linked_fab_settings_are_refused_unread() {
+    let fakes = Fakes::new(Skill::Works);
+    std::fs::create_dir_all(fakes.root.join(".github")).unwrap();
+    let settings = fakes.root.join(FAB_SETTINGS);
+    let mut big = "# padding\n".repeat(64 * 1024 / 10 + 1);
+    big.push_str("owner = \"octo\"\n");
+    std::fs::write(&settings, big).unwrap();
+    let (result, _) = fakes.init(&[], &Unread);
+    assert!(
+        matches!(&result, Err(SetupError::FabInstalled { reason, .. }) if reason == "is longer than 64 KiB"),
+        "{result:?}"
+    );
+    std::fs::remove_file(&settings).unwrap();
+    std::os::unix::fs::symlink("/dev/zero", &settings).unwrap();
+    let (result, _) = fakes.init(&[], &Unread);
+    assert!(
+        matches!(&result, Err(SetupError::FabInstalled { reason, .. })
+            if reason == "is a symlink, which sltk does not follow"),
+        "{result:?}"
+    );
+    assert!(fakes.calls().is_empty());
+}
+
+#[test]
+fn a_program_in_the_repository_is_not_run_for_a_relative_path_entry() {
+    for prefix in ["", "."] {
+        let fakes = Fakes::new(Skill::Works);
+        let planted = fakes.root.join("planted");
+        for tool in ["fab", "arcl"] {
+            write_script(
+                &fakes.root.join(tool),
+                &format!("#!/bin/sh\n: > '{}'\n", planted.display()),
+            );
+        }
+        let mut path = OsString::from(prefix);
+        path.push(":");
+        path.push(&fakes.bin);
+        let (result, _) = fakes.init_on(&path, &settings(), &[], &Fixed);
+        result.unwrap();
+        assert!(!planted.exists(), "PATH={path:?} ran the repository's fab");
+        assert_eq!(fakes.calls()[0], fakes.call(&FAB_INIT));
+    }
+}
+
+#[test]
+fn a_program_on_no_absolute_path_entry_is_named() {
+    let fakes = Fakes::new(Skill::Works);
+    let (result, _) = fakes.init_on(OsStr::new(".:relative"), &settings(), &[], &Fixed);
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains(": no executable file named fab in an absolute PATH directory. Ran: none."),
+        "{err}"
+    );
+    assert!(fakes.calls().is_empty());
 }
 
 #[test]
@@ -304,10 +431,9 @@ fn fab_settings_sltk_cannot_read_are_refused_before_any_download() {
 
 #[test]
 fn a_rerun_with_other_flags_is_refused() {
-    let fakes = Fakes::new(Skill::Works);
+    let fakes = Fakes::new(Skill::FailsOnce);
     let (result, _) = fakes.init(&[], &Fixed);
-    result.unwrap();
-    std::fs::remove_file(fakes.root.join(pin::PATH)).unwrap();
+    assert!(matches!(result, Err(SetupError::Failed { .. })), "{result:?}");
     let other = FabSettings::new(
         "hubot".into(),
         "Ada Lovelace <ada@example.com>".into(),

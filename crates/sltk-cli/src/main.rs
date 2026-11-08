@@ -93,11 +93,13 @@ enum Command {
     /// command succeeds it writes .github/sltk.toml, pinning this sltk
     /// release and the sha256 of its archives, read from the release's
     /// .sha256 files. It reads those first, so it changes nothing when this
-    /// sltk has no published release. It refuses a repository that already
-    /// has .github/sltk.toml, or a .github/fabrial.toml with other settings
-    /// than the flags give. A .github/fabrial.toml with the same settings is
-    /// left from an earlier run, so it skips `fab init`. Exits 0 when set up,
-    /// 1 otherwise.
+    /// sltk has no published release. Before the first command it records
+    /// the flags and the train's fab version in sltk-init in the git
+    /// directory, and removes that record after writing the pin. It refuses
+    /// a repository that already has .github/sltk.toml, or any
+    /// .github/fabrial.toml but one an earlier run left: the record matches
+    /// the flags, and the file holds the same settings and the train's fab
+    /// version. Then it skips `fab init`. Exits 0 when set up, 1 otherwise.
     Init {
         /// GitHub login of the person who approves pull requests.
         #[arg(long)]

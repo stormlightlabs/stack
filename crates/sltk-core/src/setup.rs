@@ -4,6 +4,10 @@
 //! The pin records the sha256 of each platform's `sltk` archive, copied from
 //! the `.sha256` files on this release, so `init` reads those before it runs
 //! anything. It writes the pin only when every command succeeded.
+//!
+//! Before the first command it writes a record of the run, [`RECORD`], in
+//! the repository's git directory, and removes it after the pin. A rerun
+//! skips `fab init` only when that record and fab's settings both match.
 
 use std::ffi::OsStr;
 use std::io::{Read, Write};
@@ -22,6 +26,10 @@ pub const RELEASE_HASH_URL: &str =
 /// Where `fab init` writes fab's settings, relative to the repository root.
 pub const FAB_SETTINGS: &str = ".github/fabrial.toml";
 
+/// The file in the repository's git directory where `init` records a run
+/// that has not written the pin yet, as `git rev-parse --git-path` names it.
+pub const RECORD: &str = "sltk-init";
+
 /// Why `init` refuses a repository that something other than its own earlier
 /// run set up, and where that work is planned.
 const ADOPT: &str = "sltk cannot adopt a repository set up by hand yet \
@@ -34,6 +42,9 @@ const UNPUBLISHED: &str =
 /// The longest `.sha256` file [`ReleaseHashes`] reads, in bytes. dist writes
 /// the digest and the archive name on one line.
 const MAX_HASH_FILE: u64 = 4096;
+
+/// The longest fab settings file or run record `init` reads, in bytes.
+const MAX_SETTINGS_FILE: u64 = 64 * 1024;
 
 /// A setting `sltk init` passes to `fab init`, by its flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +115,14 @@ pub enum SetupError {
     /// earlier `sltk init` with the same flags wrote.
     #[error("sltk: {} {reason}; {ADOPT}", path.display())]
     FabInstalled { path: PathBuf, reason: String },
+    /// The record of an earlier run could not be read, or the record of this
+    /// one could not be written.
+    #[error("sltk: {} {reason}", path.display())]
+    Record { path: PathBuf, reason: String },
+    /// The repository's git directory, where `init` records its run, could
+    /// not be found.
+    #[error("sltk: could not find the git directory of {}: {reason}; sltk init runs in a git repository", root.display())]
+    NoGitDir { root: PathBuf, reason: String },
     /// A fab setting is not valid.
     #[error("sltk: {flag} {reason}")]
     BadFlag { flag: &'static str, reason: String },
@@ -183,8 +202,8 @@ pub struct Init<'a> {
     pub with: &'a [String],
     /// Where the `sltk` archive hashes come from.
     pub hashes: &'a dyn HashSource,
-    /// The `PATH` to find and run the setup commands with, or `None` for the
-    /// one `sltk` runs with.
+    /// The `PATH` to find the setup commands on and run them with, or `None`
+    /// for the one `sltk` runs with. Only its absolute entries are searched.
     pub path: Option<&'a OsStr>,
 }
 
@@ -239,6 +258,38 @@ impl HashSource for ReleaseHashes<'_> {
     }
 }
 
+/// What `init` records in [`RECORD`] before its first command: the flags it
+/// passes to `fab init` and the train's fab version, which that fab writes as
+/// the settings' `version`.
+#[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+struct Record {
+    owner: String,
+    trailer: String,
+    gates: String,
+    fab: String,
+}
+
+impl Record {
+    /// The value for `flag`.
+    fn get(&self, flag: Flag) -> &str {
+        match flag {
+            Flag::Owner => &self.owner,
+            Flag::Trailer => &self.trailer,
+            Flag::Gates => &self.gates,
+        }
+    }
+
+    /// The record as TOML. [`Flag::check`] keeps quotes, backslashes and
+    /// line breaks out of the flags, so each goes between quotes as it is.
+    fn render(&self) -> String {
+        format!(
+            "# sltk init passed these settings to fab init and has not written the pin yet.\n\
+             owner = \"{}\"\ntrailer = \"{}\"\ngates = \"{}\"\nfab = \"{}\"\n",
+            self.owner, self.trailer, self.gates, self.fab
+        )
+    }
+}
+
 /// The setup commands `init` runs, in train order: those of every essential
 /// tool and of each tool in `with`. `fab init` gets fab's three flags.
 pub fn commands(train: &Train, settings: &FabSettings, with: &[String]) -> Vec<Vec<String>> {
@@ -261,20 +312,33 @@ pub fn commands(train: &Train, settings: &FabSettings, with: &[String]) -> Vec<V
 }
 
 /// Runs `sltk init`: checks the repository, reads this release's archive
-/// hashes and checks the pin, runs each of [`commands`] in the repository
-/// root, stopping at the first failure, and then writes the pin. Writes the
+/// hashes and checks the pin, records the run in the git directory, runs
+/// each of [`commands`] in the repository root, stopping at the first
+/// failure, and then writes the pin and removes the record. Writes the
 /// command lines and the pin's path to `output`.
 ///
-/// Refuses a repository that already has a pin, or fab's settings file with
-/// other settings than `init.settings`. A settings file with the same ones is
-/// what an earlier run that failed after `fab init` left, so `init` skips
-/// `fab init`, which refuses to run twice, and runs the rest.
+/// Refuses a repository that already has a pin, or fab's settings file that
+/// an earlier `init` with the same flags and the train's fab did not leave.
+/// When it did, `init` skips `fab init`, which refuses to run twice, and runs
+/// the rest.
 pub fn init(train: &Train, version: &str, init: Init, output: &mut dyn Write) -> Result<Pin, SetupError> {
     let path = init.root.join(pin::PATH);
     if path.exists() {
         return Err(SetupError::PinExists { path });
     }
-    let fab_done = fab_installed(init.root, init.settings)?;
+    let fab_version = train
+        .tools
+        .iter()
+        .find(|tool| tool.name == "fab")
+        .map_or("", |tool| tool.version.as_str());
+    let record = Record {
+        owner: init.settings.owner.clone(),
+        trailer: init.settings.trailer.clone(),
+        gates: init.settings.gates.clone(),
+        fab: fab_version.to_owned(),
+    };
+    let record_path = record_path(init.root)?;
+    let fab_done = fab_installed(init.root, &record_path, &record)?;
     let mut sha256 = std::collections::BTreeMap::new();
     for platform in pin::TARGETS {
         let hash = init.hashes.sha256(platform).map_err(|message| SetupError::Hash {
@@ -289,6 +353,17 @@ pub fn init(train: &Train, version: &str, init: Init, output: &mut dyn Write) ->
     pin.render(train)?;
     let commands = commands(train, init.settings, init.with);
     let lines: Vec<String> = commands.iter().map(|command| command_line(command)).collect();
+    // Removing an earlier record first replaces a symlink rather than
+    // writing through it.
+    let write_record = || match std::fs::remove_file(&record_path) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+        _ => std::fs::write(&record_path, record.render()),
+    };
+    write_record().map_err(|err| SetupError::Record {
+        path: record_path.clone(),
+        reason: format!("could not be written: {err}"),
+    })?;
+    let search = init.path.map(OsStr::to_owned).or_else(|| std::env::var_os("PATH"));
     let mut ran = Vec::new();
     for (i, command) in commands.iter().enumerate() {
         let line = &lines[i];
@@ -299,17 +374,24 @@ pub fn init(train: &Train, version: &str, init: Init, output: &mut dyn Write) ->
         }
         let _ = writeln!(output, "running {line}");
         let progress = || Progress { ran: ran.clone(), not_run: lines[i + 1..].to_vec() };
-        let mut process = Command::new(&command[0]);
-        process.args(&command[1..]).current_dir(init.root);
-        if let Some(path) = init.path {
-            process.env("PATH", path);
-        }
-        let status = process.status().map_err(|source| SetupError::Spawn {
+        let spawn = |source| SetupError::Spawn {
             command: line.clone(),
             dir: init.root.to_owned(),
             source,
             progress: progress(),
+        };
+        let program = find_program(&command[0], search.as_deref()).ok_or_else(|| {
+            spawn(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no executable file named {} in an absolute PATH directory", command[0]),
+            ))
         })?;
+        let mut process = Command::new(program);
+        process.args(&command[1..]).current_dir(init.root);
+        if let Some(path) = init.path {
+            process.env("PATH", path);
+        }
+        let status = process.status().map_err(spawn)?;
         if !status.success() {
             return Err(SetupError::Failed { command: line.clone(), status, progress: progress() });
         }
@@ -317,7 +399,46 @@ pub fn init(train: &Train, version: &str, init: Init, output: &mut dyn Write) ->
     }
     pin.write(init.root, train)?;
     let _ = writeln!(output, "wrote {}", pin::PATH);
+    if let Err(err) = std::fs::remove_file(&record_path) {
+        let _ = writeln!(output, "could not remove {}: {err}", record_path.display());
+    }
     Ok(pin)
+}
+
+/// The absolute path of `name` on `path`: the first absolute directory in it
+/// that holds a regular file named `name` with an execute bit. Empty and
+/// relative entries are skipped, so a program in the repository is never run
+/// for a bare name. A name holding a `/` is not searched.
+pub fn find_program(name: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    std::env::split_paths(path?)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// A path git printed on its own line, from its raw bytes. On Unix any bytes
+/// make a path; elsewhere the path must be UTF-8.
+pub fn path_from_git(mut stdout: Vec<u8>) -> Result<PathBuf, String> {
+    while stdout.last().is_some_and(|b| matches!(b, b'\n' | b'\r')) {
+        stdout.pop();
+    }
+    if stdout.is_empty() {
+        return Err("git printed no path".to_owned());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(stdout)))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(stdout)
+            .map(PathBuf::from)
+            .map_err(|_| "git printed a path that is not UTF-8".to_owned())
+    }
 }
 
 /// Whether `command` is the train's `fab init`.
@@ -325,24 +446,24 @@ fn is_fab_init(command: &[String]) -> bool {
     command.len() >= 2 && command[0] == "fab" && command[1] == "init"
 }
 
-/// Whether fab is already installed in `root` with `settings`: `false` when
-/// there is no [`FAB_SETTINGS`], `true` when it holds the same owner, trailer
-/// and gates, and an error otherwise. Reads the file as fab does, as TOML
-/// with those three string keys.
-fn fab_installed(root: &Path, settings: &FabSettings) -> Result<bool, SetupError> {
-    /// The keys of fab's settings file that `fab init` takes as flags.
+/// Whether fab is already installed in `root` by an earlier `init` that
+/// stopped before the pin: `false` when there is no [`FAB_SETTINGS`], `true`
+/// when it holds `record`'s owner, trailer and gates and `record`'s fab as
+/// its version, and the record at `record_path` matches `record` too, and an
+/// error otherwise. Reads the settings as fab does, as TOML.
+fn fab_installed(root: &Path, record_path: &Path, record: &Record) -> Result<bool, SetupError> {
+    /// The keys of fab's settings file that `init` compares.
     #[derive(serde::Deserialize)]
     struct Installed {
         owner: String,
         trailer: String,
         gates: String,
+        version: String,
     }
     let path = root.join(FAB_SETTINGS);
     let refuse = |reason: String| SetupError::FabInstalled { path: path.clone(), reason };
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(refuse(format!("could not be read: {err}"))),
+    let Some(text) = read_small(&path).map_err(refuse)? else {
+        return Ok(false);
     };
     let installed: Installed = toml::from_str(&text)
         .map_err(|err| refuse(format!("could not be read as fab's settings: {}", err.message())))?;
@@ -352,13 +473,92 @@ fn fab_installed(root: &Path, settings: &FabSettings) -> Result<bool, SetupError
         (Flag::Gates, installed.gates),
     ]
     .into_iter()
-    .filter(|(flag, value)| settings.get(*flag) != value)
+    .filter(|(flag, value)| record.get(*flag) != value)
     .map(|(flag, _)| flag.name())
     .collect();
-    if differ.is_empty() {
-        Ok(true)
-    } else {
-        Err(refuse(format!("holds other values for {}", differ.join(", "))))
+    if !differ.is_empty() {
+        return Err(refuse(format!("holds other values for {}", differ.join(", "))));
+    }
+    if installed.version != record.fab {
+        return Err(refuse(format!(
+            "was written by fab {}, not by the train's fab {}",
+            installed.version, record.fab
+        )));
+    }
+    let not_ours = || refuse("was not written by an earlier sltk init".to_owned());
+    let bad_record = |reason: String| SetupError::Record { path: record_path.to_owned(), reason };
+    let Some(text) = read_small(record_path).map_err(bad_record)? else {
+        return Err(not_ours());
+    };
+    let earlier: Record =
+        toml::from_str(&text).map_err(|err| bad_record(format!("could not be read: {}", err.message())))?;
+    if &earlier != record {
+        return Err(not_ours());
+    }
+    Ok(true)
+}
+
+/// Where `init` records its run for `root`: [`RECORD`] in the git directory,
+/// as `git rev-parse --git-path` gives it, so a linked worktree gets its own.
+fn record_path(root: &Path) -> Result<PathBuf, SetupError> {
+    let fail = |reason: String| SetupError::NoGitDir { root: root.to_owned(), reason };
+    let git = find_program("git", std::env::var_os("PATH").as_deref())
+        .ok_or_else(|| fail("no executable file named git in an absolute PATH directory".to_owned()))?;
+    let output = Command::new(git)
+        .args(["rev-parse", "--git-path", RECORD])
+        .current_dir(root)
+        .output()
+        .map_err(|err| fail(format!("could not run git: {err}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(fail(stderr.trim().to_owned()));
+    }
+    Ok(root.join(path_from_git(output.stdout).map_err(fail)?))
+}
+
+/// The text of the regular file at `path`, or `None` when there is none.
+/// Refuses a symlink, anything but a regular file, and a file longer than
+/// [`MAX_SETTINGS_FILE`], with the reason as the error.
+fn read_small(path: &Path) -> Result<Option<String>, String> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("could not be read: {err}")),
+    };
+    if meta.file_type().is_symlink() {
+        return Err("is a symlink, which sltk does not follow".to_owned());
+    }
+    if !meta.is_file() {
+        return Err("is not a regular file".to_owned());
+    }
+    let too_long = || format!("is longer than {} KiB", MAX_SETTINGS_FILE / 1024);
+    if meta.len() > MAX_SETTINGS_FILE {
+        return Err(too_long());
+    }
+    let file = std::fs::File::open(path).map_err(|err| format!("could not be read: {err}"))?;
+    let mut text = String::new();
+    file.take(MAX_SETTINGS_FILE + 1)
+        .read_to_string(&mut text)
+        .map_err(|err| format!("could not be read: {err}"))?;
+    if text.len() as u64 > MAX_SETTINGS_FILE {
+        return Err(too_long());
+    }
+    Ok(Some(text))
+}
+
+/// Whether `path` is a regular file, after symlinks, with an execute bit.
+fn is_executable(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_file()
     }
 }
 

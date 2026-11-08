@@ -105,21 +105,31 @@ fn repository_root(dir: Option<&Path>) -> Result<PathBuf, String> {
         }
         return Ok(dir.to_owned());
     }
-    let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
+    git_toplevel(None)
+}
+
+/// The top of the git repository holding `cwd`, or the current directory
+/// when `cwd` is `None`. git is found on the absolute entries of `PATH`.
+fn git_toplevel(cwd: Option<&Path>) -> Result<PathBuf, String> {
+    let git = setup::find_program("git", std::env::var_os("PATH").as_deref())
+        .ok_or_else(|| format!("{NOT_A_REPOSITORY} (no executable file named git in an absolute PATH directory)\n"))?;
+    let mut command = Command::new(git);
+    command.args(["rev-parse", "--show-toplevel"]);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let output = command
         .output()
         .map_err(|err| format!("{NOT_A_REPOSITORY} (could not run git: {err})\n"))?;
-    let top = String::from_utf8(output.stdout).unwrap_or_default();
-    let top = top.trim_end_matches(['\n', '\r']);
-    if !output.status.success() || top.is_empty() {
+    if !output.status.success() {
         return Err(format!("{NOT_A_REPOSITORY}\n"));
     }
-    Ok(PathBuf::from(top))
+    setup::path_from_git(output.stdout).map_err(|err| format!("sltk: could not find the repository root: {err}\n"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Flags, question, settings};
+    use super::{Flags, git_toplevel, question, settings};
     use sltk_core::setup::Flag;
 
     fn flags(owner: Option<&str>, trailer: Option<&str>, gates: Option<&str>) -> Flags {
@@ -199,5 +209,21 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, "sltk: no answer for --owner\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_that_is_not_utf8_is_kept_as_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join(std::ffi::OsStr::from_bytes(b"repo-\xff"));
+        std::fs::create_dir(&repo).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(git_toplevel(Some(&repo)).unwrap(), repo.canonicalize().unwrap());
     }
 }
