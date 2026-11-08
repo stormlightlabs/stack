@@ -2,10 +2,11 @@
 id = "arcl-t-01M6H2B53NKD1JFH0BCHTW0EA2"
 parent = "arcl-t-01M6H2B51T9ZV42EXGEQ7GQV5X"
 title = "Read and write the repository pin"
-status = "pending"
+status = "completed"
 priority = "normal"
 position = 1
 blocked-by = ["arcl-t-01M6H2B4YC747EJDDWRBYHDFH5"]
+evidence = "Done in #9 at 2cdad72: sltk-core reads and writes .github/sltk.toml with exact version and per-platform sha256 lines that the hook's sed reads (tested with real sed), validated optional tools, strict x.y.z versions, and an atomic write."
 +++
 
 A repository records its train version,
