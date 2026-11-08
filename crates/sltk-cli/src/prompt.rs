@@ -272,6 +272,8 @@ mod tests {
         assert!(output.ends_with(PICK_QUESTION), "{output}");
     }
 
+    /// What [`ask`] returns and writes for `typed`, accepting any answer that
+    /// is not empty.
     fn asked(typed: &str) -> (Option<String>, String) {
         let mut output = Vec::new();
         let not_empty = |a: &str| if a.is_empty() { Err("is empty".to_owned()) } else { Ok(()) };
@@ -304,6 +306,9 @@ mod tests {
         let ascii = |a: &str| if a.is_ascii() { Ok(()) } else { Err("is not ASCII".to_owned()) };
         let answer = ask(&mut &b"oct\xff\nocto\n"[..], &mut output, "Owner? ", ascii).unwrap();
         assert_eq!(answer, Some("octo".to_owned()));
-        assert_eq!(String::from_utf8(output).unwrap(), "Owner? that answer is not ASCII\nOwner? ");
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "Owner? that answer is not ASCII\nOwner? "
+        );
     }
 }
