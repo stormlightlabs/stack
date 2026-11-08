@@ -5,33 +5,51 @@ use std::fmt;
 
 use crate::train::{Archive, Platform, Tier, Tool, Train};
 
+/// The C library this binary was built against, as `cfg(target_env)` names
+/// it: `gnu` or `musl` on Linux, and empty on macOS.
+const TARGET_ENV: &str = if cfg!(target_env = "musl") {
+    "musl"
+} else if cfg!(target_env = "gnu") {
+    "gnu"
+} else {
+    ""
+};
+
 /// The machine `sltk` installs onto.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Host {
     /// A platform `sltk` supports.
     Supported(Platform),
-    /// Any other machine, named by the architecture and OS Rust reports.
+    /// Any other machine, named by the architecture, OS and C library Rust
+    /// reports.
     Unsupported {
         /// The architecture, as `std::env::consts::ARCH` names it.
         arch: String,
         /// The operating system, as `std::env::consts::OS` names it.
         os: String,
+        /// The C library, as `cfg(target_env)` names it; empty when the
+        /// target names none.
+        env: String,
     },
 }
 
 impl Host {
     /// The host this binary runs on.
     pub fn detect() -> Host {
-        Host::from_parts(std::env::consts::ARCH, std::env::consts::OS)
+        Host::from_parts(std::env::consts::ARCH, std::env::consts::OS, TARGET_ENV)
     }
 
-    /// The host with this architecture and OS, named as
-    /// `std::env::consts::ARCH` and `std::env::consts::OS` name them.
-    pub fn from_parts(arch: &str, os: &str) -> Host {
-        match (arch, os) {
-            ("aarch64", "macos") => Host::Supported(Platform::AppleSilicon),
-            ("x86_64", "linux") => Host::Supported(Platform::LinuxX86_64),
-            _ => Host::Unsupported { arch: arch.to_owned(), os: os.to_owned() },
+    /// The host with this architecture, OS and C library, named as
+    /// `std::env::consts::ARCH`, `std::env::consts::OS` and
+    /// `cfg(target_env)` name them.
+    ///
+    /// A musl Linux is unsupported: fab's gnu archive is not statically
+    /// linked, so it may not run there.
+    pub fn from_parts(arch: &str, os: &str, env: &str) -> Host {
+        match (arch, os, env) {
+            ("aarch64", "macos", _) => Host::Supported(Platform::AppleSilicon),
+            ("x86_64", "linux", "gnu") => Host::Supported(Platform::LinuxX86_64),
+            _ => Host::Unsupported { arch: arch.to_owned(), os: os.to_owned(), env: env.to_owned() },
         }
     }
 
@@ -46,13 +64,32 @@ impl Host {
 
 impl fmt::Display for Host {
     /// A supported host shows its target triple; any other shows its
-    /// architecture and OS.
+    /// architecture and OS, followed by `musl` on a musl target, the one case
+    /// where the C library is why it is unsupported.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Host::Supported(platform) => write!(f, "{platform}"),
-            Host::Unsupported { arch, os } => write!(f, "{arch} {os}"),
+            Host::Unsupported { arch, os, env } if env == "musl" => write!(f, "{arch} {os} musl"),
+            Host::Unsupported { arch, os, .. } => write!(f, "{arch} {os}"),
         }
     }
+}
+
+/// Why a plan could not be made from the tools asked for.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PlanError {
+    /// `with` names a tool the train does not list.
+    #[error("sltk: the train has no tool named {tool}")]
+    UnknownTool {
+        /// The name as given.
+        tool: String,
+    },
+    /// `with` names an essential tool, which every plan installs already.
+    #[error("sltk: {tool} is always installed, so it needs no --with")]
+    EssentialTool {
+        /// The tool's name.
+        tool: String,
+    },
 }
 
 /// A tool the plan installs, with the archive it would download.
@@ -69,7 +106,7 @@ pub struct PlannedTool {
 /// A tool the plan cannot install, because the train has no archive of it for
 /// the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Unsupported {
+pub struct UnsupportedTool {
     /// The tool's name.
     pub name: String,
     /// The pinned release.
@@ -85,14 +122,26 @@ pub struct Plan {
     /// The selected tools with an archive for the host, in train order.
     pub install: Vec<PlannedTool>,
     /// The selected tools with no archive for the host, in train order.
-    pub unsupported: Vec<Unsupported>,
+    pub unsupported: Vec<UnsupportedTool>,
 }
 
 impl Plan {
     /// Plans the install of the essential tools, and of each optional tool
     /// named in `with`, onto `host`. On an unsupported host every selected
     /// tool is unsupported.
-    pub fn new(train: &Train, host: Host, with: &[&str]) -> Plan {
+    ///
+    /// Fails when `with` names a tool the train does not list, or an
+    /// essential tool.
+    pub fn new(train: &Train, host: Host, with: &[&str]) -> Result<Plan, PlanError> {
+        for &name in with {
+            match train.tools.iter().find(|tool| tool.name == name) {
+                None => return Err(PlanError::UnknownTool { tool: name.to_owned() }),
+                Some(tool) if tool.tier == Tier::Essential => {
+                    return Err(PlanError::EssentialTool { tool: name.to_owned() });
+                }
+                Some(_) => {}
+            }
+        }
         let mut install = Vec::new();
         let mut unsupported = Vec::new();
         for tool in train.tools.iter().filter(|tool| selected(tool, with)) {
@@ -102,10 +151,10 @@ impl Plan {
                     version: tool.version.clone(),
                     archive: archive.clone(),
                 }),
-                None => unsupported.push(Unsupported { name: tool.name.clone(), version: tool.version.clone() }),
+                None => unsupported.push(UnsupportedTool { name: tool.name.clone(), version: tool.version.clone() }),
             }
         }
-        Plan { host, install, unsupported }
+        Ok(Plan { host, install, unsupported })
     }
 
     /// Whether every selected tool has an archive for the host.
@@ -122,7 +171,7 @@ fn selected(tool: &Tool, with: &[&str]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Host, Plan};
+    use super::{Host, Plan, PlanError};
     use crate::train::{Platform, Train};
 
     /// One essential tool on both platforms, one essential on Linux only, and
@@ -172,36 +221,43 @@ sha256 = "80f6bc7e4ce41f7037c91330c814d94e277aed381d192960d00a130a859675e3"
 
     #[test]
     fn the_supported_hosts_map_to_their_triples() {
-        let mac = Host::from_parts("aarch64", "macos");
+        let mac = Host::from_parts("aarch64", "macos", "");
         assert_eq!(mac, Host::Supported(Platform::AppleSilicon));
         assert_eq!(mac.to_string(), "aarch64-apple-darwin");
-        let linux = Host::from_parts("x86_64", "linux");
+        let linux = Host::from_parts("x86_64", "linux", "gnu");
         assert_eq!(linux, Host::Supported(Platform::LinuxX86_64));
         assert_eq!(linux.to_string(), "x86_64-unknown-linux-gnu");
     }
 
     #[test]
     fn other_hosts_are_unsupported() {
-        for (arch, os) in [("x86_64", "macos"), ("aarch64", "linux"), ("x86_64", "windows")] {
-            let host = Host::from_parts(arch, os);
+        for (arch, os, env) in [
+            ("x86_64", "macos", ""),
+            ("aarch64", "linux", "gnu"),
+            ("x86_64", "windows", ""),
+        ] {
+            let host = Host::from_parts(arch, os, env);
             assert_eq!(host.platform(), None, "{arch} {os}");
             assert_eq!(host.to_string(), format!("{arch} {os}"));
         }
     }
 
     #[test]
-    fn detect_reads_the_build_target() {
-        assert_eq!(
-            Host::detect(),
-            Host::from_parts(std::env::consts::ARCH, std::env::consts::OS)
-        );
+    fn a_musl_linux_is_unsupported() {
+        let train = Train::embedded().unwrap();
+        let host = Host::from_parts("x86_64", "linux", "musl");
+        assert_eq!(host.platform(), None);
+        assert_eq!(host.to_string(), "x86_64 linux musl");
+        let plan = Plan::new(&train, host, &[]).unwrap();
+        assert!(plan.install.is_empty());
+        assert_eq!(names(&plan.unsupported, |t| &t.name), ["fab", "arcl"]);
     }
 
     #[test]
     fn both_supported_targets_plan_every_embedded_tool() {
         let train = Train::embedded().unwrap();
         for platform in [Platform::AppleSilicon, Platform::LinuxX86_64] {
-            let plan = Plan::new(&train, Host::Supported(platform), &[]);
+            let plan = Plan::new(&train, Host::Supported(platform), &[]).unwrap();
             assert!(plan.is_complete(), "{platform}: {:?}", plan.unsupported);
             assert_eq!(names(&plan.install, |t| &t.name), ["fab", "arcl"]);
             for planned in &plan.install {
@@ -215,7 +271,7 @@ sha256 = "80f6bc7e4ce41f7037c91330c814d94e277aed381d192960d00a130a859675e3"
     #[test]
     fn an_unsupported_host_lists_every_tool_as_unsupported() {
         let train = Train::embedded().unwrap();
-        let plan = Plan::new(&train, Host::from_parts("aarch64", "linux"), &[]);
+        let plan = Plan::new(&train, Host::from_parts("aarch64", "linux", "gnu"), &[]).unwrap();
         assert!(!plan.is_complete());
         assert!(plan.install.is_empty());
         assert_eq!(names(&plan.unsupported, |t| &t.name), ["fab", "arcl"]);
@@ -224,7 +280,7 @@ sha256 = "80f6bc7e4ce41f7037c91330c814d94e277aed381d192960d00a130a859675e3"
     #[test]
     fn a_tool_with_no_archive_for_the_platform_is_unsupported() {
         let train = Train::parse(FIXTURE).unwrap();
-        let plan = Plan::new(&train, Host::Supported(Platform::AppleSilicon), &[]);
+        let plan = Plan::new(&train, Host::Supported(Platform::AppleSilicon), &[]).unwrap();
         assert_eq!(names(&plan.install, |t| &t.name), ["alpha"]);
         assert_eq!(names(&plan.unsupported, |t| &t.name), ["beta"]);
     }
@@ -233,11 +289,30 @@ sha256 = "80f6bc7e4ce41f7037c91330c814d94e277aed381d192960d00a130a859675e3"
     fn an_optional_tool_is_planned_only_when_named() {
         let train = Train::parse(FIXTURE).unwrap();
         let linux = Host::Supported(Platform::LinuxX86_64);
-        let without = Plan::new(&train, linux.clone(), &[]);
+        let without = Plan::new(&train, linux.clone(), &[]).unwrap();
         assert_eq!(names(&without.install, |t| &t.name), ["alpha", "beta"]);
-        let with = Plan::new(&train, linux, &["gamma"]);
+        let with = Plan::new(&train, linux, &["gamma"]).unwrap();
         assert_eq!(names(&with.install, |t| &t.name), ["alpha", "beta", "gamma"]);
-        let mac = Plan::new(&train, Host::Supported(Platform::AppleSilicon), &["gamma"]);
+        let mac = Plan::new(&train, Host::Supported(Platform::AppleSilicon), &["gamma"]).unwrap();
         assert_eq!(names(&mac.unsupported, |t| &t.name), ["beta", "gamma"]);
+    }
+
+    #[test]
+    fn with_naming_a_tool_the_train_lacks_is_an_error() {
+        let train = Train::parse(FIXTURE).unwrap();
+        let err = Plan::new(&train, Host::Supported(Platform::LinuxX86_64), &["gama"]).unwrap_err();
+        assert_eq!(err, PlanError::UnknownTool { tool: "gama".to_owned() });
+        assert_eq!(err.to_string(), "sltk: the train has no tool named gama");
+    }
+
+    #[test]
+    fn with_naming_an_essential_tool_is_an_error() {
+        let train = Train::parse(FIXTURE).unwrap();
+        let err = Plan::new(&train, Host::Supported(Platform::LinuxX86_64), &["gamma", "alpha"]).unwrap_err();
+        assert_eq!(err, PlanError::EssentialTool { tool: "alpha".to_owned() });
+        assert_eq!(
+            err.to_string(),
+            "sltk: alpha is always installed, so it needs no --with"
+        );
     }
 }
