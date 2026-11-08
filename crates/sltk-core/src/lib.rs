@@ -1,6 +1,7 @@
 //! Code `sltk` shares between its crates: the release number the CLI reports
 //! and the release train it pins.
 
+pub mod platform;
 pub mod train;
 
 /// The release of this build, from the workspace manifest.
