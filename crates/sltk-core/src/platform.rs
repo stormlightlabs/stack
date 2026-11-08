@@ -15,6 +15,10 @@ const TARGET_ENV: &str = if cfg!(target_env = "musl") {
     ""
 };
 
+/// The pointer width this binary was built for, as `cfg(target_pointer_width)`
+/// names it.
+const TARGET_POINTER_WIDTH: u32 = usize::BITS;
+
 /// The machine `sltk` installs onto.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Host {
@@ -30,26 +34,40 @@ pub enum Host {
         /// The C library, as `cfg(target_env)` names it; empty when the
         /// target names none.
         env: String,
+        /// The pointer width in bits, as `cfg(target_pointer_width)` names
+        /// it.
+        pointer_width: u32,
     },
 }
 
 impl Host {
-    /// The host this binary runs on.
+    /// The host from the build target of this `sltk` binary, not from the
+    /// machine it runs on.
+    ///
+    /// An x86_64 `sltk` running under Rosetta on Apple silicon reports an
+    /// unsupported x86_64 macOS; replace it with the aarch64 build.
     pub fn detect() -> Host {
-        Host::from_parts(std::env::consts::ARCH, std::env::consts::OS, TARGET_ENV)
+        Host::from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            TARGET_ENV,
+            TARGET_POINTER_WIDTH,
+        )
     }
 
-    /// The host with this architecture, OS and C library, named as
-    /// `std::env::consts::ARCH`, `std::env::consts::OS` and
-    /// `cfg(target_env)` name them.
+    /// The host with this architecture, OS, C library and pointer width,
+    /// named as `std::env::consts::ARCH`, `std::env::consts::OS`,
+    /// `cfg(target_env)` and `cfg(target_pointer_width)` name them.
     ///
-    /// A musl Linux is unsupported: fab's gnu archive is not statically
-    /// linked, so it may not run there.
-    pub fn from_parts(arch: &str, os: &str, env: &str) -> Host {
-        match (arch, os, env) {
-            ("aarch64", "macos", _) => Host::Supported(Platform::AppleSilicon),
-            ("x86_64", "linux", "gnu") => Host::Supported(Platform::LinuxX86_64),
-            _ => Host::Unsupported { arch: arch.to_owned(), os: os.to_owned(), env: env.to_owned() },
+    /// Both supported platforms need 64-bit pointers, so an x32 Linux, which
+    /// reports `x86_64` and `gnu` with 32-bit pointers, is unsupported. A musl
+    /// Linux is unsupported too: fab's gnu archive is not statically linked,
+    /// so it may not run there.
+    pub fn from_parts(arch: &str, os: &str, env: &str, pointer_width: u32) -> Host {
+        match (arch, os, env, pointer_width) {
+            ("aarch64", "macos", _, 64) => Host::Supported(Platform::AppleSilicon),
+            ("x86_64", "linux", "gnu", 64) => Host::Supported(Platform::LinuxX86_64),
+            _ => Host::Unsupported { arch: arch.to_owned(), os: os.to_owned(), env: env.to_owned(), pointer_width },
         }
     }
 
@@ -63,14 +81,22 @@ impl Host {
 }
 
 impl fmt::Display for Host {
-    /// A supported host shows its target triple; any other shows its
-    /// architecture and OS, followed by `musl` on a musl target, the one case
-    /// where the C library is why it is unsupported.
+    /// A supported host shows its target triple. Any other shows its
+    /// architecture and OS, then its C library on a Linux whose C library is
+    /// not `gnu`, then its pointer width when that is not 64 bits.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Host::Supported(platform) => write!(f, "{platform}"),
-            Host::Unsupported { arch, os, env } if env == "musl" => write!(f, "{arch} {os} musl"),
-            Host::Unsupported { arch, os, .. } => write!(f, "{arch} {os}"),
+            Host::Unsupported { arch, os, env, pointer_width } => {
+                write!(f, "{arch} {os}")?;
+                if os == "linux" && env != "gnu" && !env.is_empty() {
+                    write!(f, " {env}")?;
+                }
+                if *pointer_width != 64 {
+                    write!(f, " {pointer_width}-bit")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -221,10 +247,10 @@ sha256 = "80f6bc7e4ce41f7037c91330c814d94e277aed381d192960d00a130a859675e3"
 
     #[test]
     fn the_supported_hosts_map_to_their_triples() {
-        let mac = Host::from_parts("aarch64", "macos", "");
+        let mac = Host::from_parts("aarch64", "macos", "", 64);
         assert_eq!(mac, Host::Supported(Platform::AppleSilicon));
         assert_eq!(mac.to_string(), "aarch64-apple-darwin");
-        let linux = Host::from_parts("x86_64", "linux", "gnu");
+        let linux = Host::from_parts("x86_64", "linux", "gnu", 64);
         assert_eq!(linux, Host::Supported(Platform::LinuxX86_64));
         assert_eq!(linux.to_string(), "x86_64-unknown-linux-gnu");
     }
@@ -236,7 +262,7 @@ sha256 = "80f6bc7e4ce41f7037c91330c814d94e277aed381d192960d00a130a859675e3"
             ("aarch64", "linux", "gnu"),
             ("x86_64", "windows", ""),
         ] {
-            let host = Host::from_parts(arch, os, env);
+            let host = Host::from_parts(arch, os, env, 64);
             assert_eq!(host.platform(), None, "{arch} {os}");
             assert_eq!(host.to_string(), format!("{arch} {os}"));
         }
@@ -245,12 +271,35 @@ sha256 = "80f6bc7e4ce41f7037c91330c814d94e277aed381d192960d00a130a859675e3"
     #[test]
     fn a_musl_linux_is_unsupported() {
         let train = Train::embedded().unwrap();
-        let host = Host::from_parts("x86_64", "linux", "musl");
+        let host = Host::from_parts("x86_64", "linux", "musl", 64);
         assert_eq!(host.platform(), None);
         assert_eq!(host.to_string(), "x86_64 linux musl");
         let plan = Plan::new(&train, host, &[]).unwrap();
         assert!(plan.install.is_empty());
         assert_eq!(names(&plan.unsupported, |t| &t.name), ["fab", "arcl"]);
+    }
+
+    #[test]
+    fn a_linux_with_another_c_library_shows_it() {
+        let host = Host::from_parts("x86_64", "linux", "uclibc", 64);
+        assert_eq!(host.platform(), None);
+        assert_eq!(host.to_string(), "x86_64 linux uclibc");
+    }
+
+    #[test]
+    fn an_x32_linux_is_unsupported() {
+        let train = Train::embedded().unwrap();
+        let host = Host::from_parts("x86_64", "linux", "gnu", 32);
+        assert_eq!(host.platform(), None);
+        assert_eq!(host.to_string(), "x86_64 linux 32-bit");
+        let plan = Plan::new(&train, host, &[]).unwrap();
+        assert!(plan.install.is_empty());
+        assert_eq!(names(&plan.unsupported, |t| &t.name), ["fab", "arcl"]);
+    }
+
+    #[test]
+    fn a_32_bit_mac_target_is_unsupported() {
+        assert_eq!(Host::from_parts("aarch64", "macos", "", 32).platform(), None);
     }
 
     #[test]
@@ -271,7 +320,7 @@ sha256 = "80f6bc7e4ce41f7037c91330c814d94e277aed381d192960d00a130a859675e3"
     #[test]
     fn an_unsupported_host_lists_every_tool_as_unsupported() {
         let train = Train::embedded().unwrap();
-        let plan = Plan::new(&train, Host::from_parts("aarch64", "linux", "gnu"), &[]).unwrap();
+        let plan = Plan::new(&train, Host::from_parts("aarch64", "linux", "gnu", 64), &[]).unwrap();
         assert!(!plan.is_complete());
         assert!(plan.install.is_empty());
         assert_eq!(names(&plan.unsupported, |t| &t.name), ["fab", "arcl"]);

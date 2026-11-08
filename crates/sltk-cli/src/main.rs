@@ -6,6 +6,13 @@ use clap::{Parser, Subcommand};
 use sltk_core::platform::{Host, Plan};
 use sltk_core::train::Train;
 
+/// The exit code of `sltk install` after it prints a plan for a supported
+/// machine: nothing was installed, so a script must not read it as success.
+const NOT_INSTALLED: u8 = 3;
+
+/// The last line `sltk install` prints after a plan for a supported machine.
+const NOT_INSTALLED_LINE: &str = "sltk: nothing was installed, because downloading is not built yet\n";
+
 /// The commands `sltk` runs.
 #[derive(Subcommand)]
 enum Command {
@@ -13,9 +20,9 @@ enum Command {
     Train,
     /// Print the tools and archives an install on this machine would use.
     ///
-    /// Downloading comes in a later release: for now this prints the plan and
-    /// downloads nothing. Exits non-zero, naming the tools, when a tool has no
-    /// archive for this machine.
+    /// Downloading comes in a later release: for now this prints the plan,
+    /// installs nothing and exits 3. Exits 1, naming the tools, when a tool
+    /// has no archive for this machine.
     Install,
 }
 
@@ -38,16 +45,16 @@ fn main() -> ExitCode {
         }
     };
     let result = match command {
-        Command::Train => Ok(pinned_set(&train)),
+        Command::Train => Ok((pinned_set(&train), 0)),
         Command::Install => match Plan::new(&train, Host::detect(), &[]) {
-            Ok(plan) => install_report(&plan),
+            Ok(plan) => install_report(&plan).map(|out| (out, NOT_INSTALLED)),
             Err(err) => Err(format!("{err}\n")),
         },
     };
     match result {
-        Ok(out) => {
+        Ok((out, code)) => {
             print!("{out}");
-            ExitCode::SUCCESS
+            ExitCode::from(code)
         }
         Err(err) => {
             eprint!("{err}");
@@ -57,7 +64,8 @@ fn main() -> ExitCode {
 }
 
 /// What `sltk install` prints for a plan: the tools and archives it would
-/// install, or, as an error, the tools with no archive for the host.
+/// install, then a line saying it installed nothing, or, as an error, the
+/// tools with no archive for the host.
 fn install_report(plan: &Plan) -> Result<String, String> {
     if !plan.is_complete() {
         let mut err = format!("sltk: these tools have no archive for {}:\n", plan.host);
@@ -73,6 +81,7 @@ fn install_report(plan: &Plan) -> Result<String, String> {
             tool.name, tool.version, tool.archive.name
         ));
     }
+    out.push_str(NOT_INSTALLED_LINE);
     Ok(out)
 }
 
@@ -149,14 +158,15 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
         let plan = Plan::new(&train, Host::Supported(Platform::LinuxX86_64), &[]).unwrap();
         assert_eq!(
             install_report(&plan).unwrap(),
-            "sltk would install on x86_64-unknown-linux-gnu:\n  alpha 1.2.3 from alpha-x86_64-unknown-linux-gnu.tar.xz\n"
+            "sltk would install on x86_64-unknown-linux-gnu:\n  alpha 1.2.3 from alpha-x86_64-unknown-linux-gnu.tar.xz\n\
+             sltk: nothing was installed, because downloading is not built yet\n"
         );
     }
 
     #[test]
     fn install_fails_with_the_tools_a_host_cannot_get() {
         let train = Train::embedded().unwrap();
-        let plan = Plan::new(&train, Host::from_parts("aarch64", "linux", "gnu"), &[]).unwrap();
+        let plan = Plan::new(&train, Host::from_parts("aarch64", "linux", "gnu", 64), &[]).unwrap();
         let err = install_report(&plan).unwrap_err();
         let mut expected = "sltk: these tools have no archive for aarch64 linux:\n".to_owned();
         for tool in &train.tools {
