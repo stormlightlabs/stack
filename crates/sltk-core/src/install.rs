@@ -32,6 +32,10 @@ pub const MAX_BINARY: u64 = 128 << 20;
 /// already there.
 const STAGE_ATTEMPTS: u32 = 8;
 
+/// How old a leftover temporary file must be before an install removes it.
+/// A run that is still staging its files is younger than this.
+const STALE_TEMP_AGE: Duration = Duration::from_secs(60 * 60);
+
 /// Why an install stopped. Every error but [`InstallError::Partial`] leaves
 /// the bin directory as it was.
 #[derive(Debug, thiserror::Error)]
@@ -157,9 +161,15 @@ pub struct Installed {
 
 /// Downloads over HTTPS with a blocking client.
 ///
-/// It refuses plain HTTP, redirects included, and trusts the platform's
-/// certificate store. It reads `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY`
-/// from the environment, and on Linux `SSL_CERT_FILE` and `SSL_CERT_DIR`.
+/// It refuses plain HTTP on every hop, redirects included, and trusts the
+/// platform's certificate store. It sends every request through the proxy
+/// named by the first of `ALL_PROXY`, `all_proxy`, `HTTPS_PROXY`,
+/// `https_proxy`, `HTTP_PROXY` and `http_proxy` that holds a valid proxy URL,
+/// so `HTTP_PROXY` applies to these https downloads when the others are
+/// unset. `NO_PROXY`, or `no_proxy` when it is unset, lists the hosts that
+/// skip the proxy. Only `http://` and `https://` proxies work; this build has
+/// no SOCKS support. TLS and the train's sha256 protect the download through
+/// any proxy. On Linux it also reads `SSL_CERT_FILE` and `SSL_CERT_DIR`.
 pub struct HttpFetch {
     agent: ureq::Agent,
 }
@@ -247,8 +257,9 @@ pub fn bin_dir(cargo_home: Option<OsString>, home: Option<OsString>) -> Result<P
 ///
 /// It downloads every archive with `fetch`, checks each against the
 /// train's sha256 and takes each binary out in memory before it writes
-/// anything. Then it writes each binary to a temporary file in `bin` with
-/// mode 0755, and renames each over its target. Any failure before the
+/// anything. Then it removes temporary files an interrupted run left in `bin`
+/// for these binaries, if they are over an hour old, writes each binary to a
+/// temporary file in `bin` with mode 0755, and renames each over its target. Any failure before the
 /// renames leaves `bin` as it was, and removes the temporary files. A
 /// rename that fails leaves the tools before it installed and the rest as
 /// they were.
@@ -280,6 +291,10 @@ fn install_with(
         binaries.push(extract(&tool.name, &tool.binary, &archive, limits)?);
     }
     std::fs::create_dir_all(bin).map_err(|source| InstallError::Io { path: bin.to_owned(), source })?;
+    if let Some(cutoff) = std::time::SystemTime::now().checked_sub(STALE_TEMP_AGE) {
+        let names: Vec<&str> = plan.install.iter().map(|tool| tool.binary.as_str()).collect();
+        remove_stale_temps(bin, &names, cutoff);
+    }
     let mut staged: Vec<PathBuf> = Vec::with_capacity(binaries.len());
     for (tool, bytes) in plan.install.iter().zip(&binaries) {
         match stage(bin, &tool.binary, bytes, suffix) {
@@ -463,6 +478,46 @@ fn random_suffix() -> u64 {
     hasher.finish()
 }
 
+/// Removes the temporary files in `bin` that [`stage`] would name for one of
+/// `binaries` and that were last modified before `cutoff`, ignoring errors.
+///
+/// It reads each entry without following symlinks and removes only regular
+/// files, so a symlink or directory with a matching name stays.
+fn remove_stale_temps(bin: &Path, binaries: &[&str], cutoff: std::time::SystemTime) {
+    let Ok(dir) = std::fs::read_dir(bin) else { return };
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !binaries.iter().any(|binary| is_temp_name(name, binary)) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        if !meta.file_type().is_file() || !meta.modified().is_ok_and(|at| at < cutoff) {
+            continue;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Whether `name` is `.<binary>.sltk-<pid>-<16 hex digits>.tmp`, the form
+/// [`stage`] gives its files.
+fn is_temp_name(name: &str, binary: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix('.')
+        .and_then(|rest| rest.strip_prefix(binary))
+        .and_then(|rest| rest.strip_prefix(".sltk-"))
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let Some((pid, suffix)) = rest.split_once('-') else { return false };
+    !pid.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && suffix.len() == 16
+        && suffix.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Removes each file, ignoring failures.
 fn remove_all(paths: &[PathBuf]) {
     for path in paths {
@@ -475,7 +530,10 @@ mod tests {
     use std::io::Read;
     use std::path::Path;
 
-    use super::{Fetch, InstallError, Limits, bin_dir, extract, install_with, random_suffix, read_capped, sha256_hex};
+    use super::{
+        Fetch, HttpFetch, InstallError, Limits, STALE_TEMP_AGE, bin_dir, extract, install_with, is_temp_name,
+        random_suffix, read_capped, sha256_hex,
+    };
     use crate::platform::{Host, Plan};
     use crate::train::{Platform, Train};
 
@@ -833,6 +891,71 @@ sha256 = "{}"
         assert_eq!(entries(bin.path()), [blocker.as_str(), "alpha"]);
         assert_eq!(std::fs::read(bin.path().join(&blocker)).unwrap(), b"not ours");
         assert_eq!(std::fs::read(bin.path().join("alpha")).unwrap(), b"alpha 1");
+    }
+
+    /// Writes `contents` to `path` and sets its modification time `age` ago.
+    fn write_aged(path: &Path, contents: &str, age: std::time::Duration) {
+        std::fs::write(path, contents).unwrap();
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - age).unwrap();
+    }
+
+    #[test]
+    fn an_install_removes_only_old_regular_temporary_files_of_its_binaries() {
+        let (train, fetch, _, _) = fixture("", "");
+        let bin = tempfile::tempdir().unwrap();
+        let old = STALE_TEMP_AGE * 2;
+        let stale = ".alpha.sltk-123-00000000deadbeef.tmp";
+        let fresh = ".beta.sltk-123-00000000deadbeef.tmp";
+        let other_binary = ".gamma.sltk-123-00000000deadbeef.tmp";
+        let short_suffix = ".alpha.sltk-123-deadbeef.tmp";
+        let pid_only = ".alpha.sltk-123.tmp";
+        write_aged(&bin.path().join(stale), "left by a killed run", old);
+        write_aged(&bin.path().join(fresh), "another run's", std::time::Duration::ZERO);
+        for name in [other_binary, short_suffix, pid_only] {
+            write_aged(&bin.path().join(name), "not ours", old);
+        }
+        let mut expected = vec![fresh, other_binary, pid_only, short_suffix, "alpha", "beta"];
+        #[cfg(unix)]
+        let link = ".beta.sltk-456-0123456789abcdef.tmp";
+        #[cfg(unix)]
+        {
+            // The link's target is old, so following it would remove the link.
+            write_aged(&bin.path().join("target"), "kept", old);
+            std::os::unix::fs::symlink("target", bin.path().join(link)).unwrap();
+            expected.extend([link, "target"]);
+        }
+        install_with(&linux_plan(&train), &fetch, bin.path(), SMALL, &mut random_suffix).unwrap();
+        expected.sort();
+        assert_eq!(entries(bin.path()), expected);
+        #[cfg(unix)]
+        assert!(
+            std::fs::symlink_metadata(bin.path().join(link))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn a_temporary_name_matches_only_the_form_stage_writes() {
+        assert!(is_temp_name(".fab.sltk-1-0123456789abcdef.tmp", "fab"));
+        assert!(!is_temp_name(".fab.sltk-1-0123456789ABCDEF.tmp", "fab"));
+        assert!(!is_temp_name(".fab.sltk--0123456789abcdef.tmp", "fab"));
+        assert!(!is_temp_name(".fab.sltk-x-0123456789abcdef.tmp", "fab"));
+        assert!(!is_temp_name(".fab.sltk-1-0123456789abcdef0.tmp", "fab"));
+        assert!(!is_temp_name(".fab.sltk-1-0123456789abcdef.tmpx", "fab"));
+        assert!(!is_temp_name("fab.sltk-1-0123456789abcdef.tmp", "fab"));
+        assert!(!is_temp_name(".fabx.sltk-1-0123456789abcdef.tmp", "fab"));
+    }
+
+    /// ureq checks `https_only` before each hop it connects, redirects
+    /// included, so this setting is what refuses a redirect from https to
+    /// http. A test of the redirect itself needs a TLS server the platform
+    /// verifier trusts, which a test cannot set up.
+    #[test]
+    fn the_http_client_refuses_plain_http_on_every_hop() {
+        assert!(HttpFetch::new().agent.config().https_only());
     }
 
     #[test]

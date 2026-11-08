@@ -14,7 +14,7 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
 
-use sltk_core::install::{Fetch, InstallError, bin_dir, install, sha256_hex};
+use sltk_core::install::{Fetch, HttpFetch, InstallError, bin_dir, install, sha256_hex};
 use sltk_core::platform::{Host, Plan, PlanError};
 use sltk_core::train::{Platform, Train};
 
@@ -255,5 +255,24 @@ fn with_names_checked_against_the_train() {
     assert_eq!(
         Plan::new(&train, linux(), &["dalil"]).unwrap_err(),
         PlanError::UnknownTool { tool: "dalil".to_owned() }
+    );
+}
+
+/// `HttpFetch` refuses an `http://` URL before it opens a connection: the
+/// local listener it is pointed at never sees one.
+#[test]
+fn the_http_client_refuses_a_plain_http_url_without_connecting() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/archive.tar.xz", listener.local_addr().unwrap());
+    let err = match HttpFetch::new().open(&url) {
+        Ok(_) => panic!("{url} was fetched"),
+        Err(err) => err,
+    };
+    assert_eq!(err, format!("configured for https only: {url}"));
+    let accepted = listener.accept();
+    assert!(
+        matches!(&accepted, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "{accepted:?}"
     );
 }
