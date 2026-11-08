@@ -1,18 +1,23 @@
 //! Questions `sltk` asks a person on a terminal. Each takes a reader and a
 //! writer, so tests answer them without a terminal.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 
 /// How many times [`confirm`] and [`pick`] ask before they treat the answers
 /// as no: the first question and three re-asks.
 const ASKS: usize = 4;
 
+/// The most bytes of one answer line that [`read_answer`] keeps. It discards
+/// the rest of a longer line.
+const LINE_BYTES: u64 = 4096;
+
 /// The question [`pick`] asks after it lists the tools.
 const PICK_QUESTION: &str = "Add which? Numbers or names, Enter for none: ";
 
 /// Writes `question` and reads one line of answer. Enter, `y` and `yes` mean
-/// yes; `n` and `no` mean no, in any case. Any other answer asks again, up to
-/// [`ASKS`] times in all, and then counts as no. End of input counts as no.
+/// yes; `n` and `no` mean no, in any case. Any other answer, including one
+/// that is not UTF-8, asks again, up to [`ASKS`] times in all, and then counts
+/// as no. End of input counts as no.
 pub fn confirm(input: &mut impl BufRead, output: &mut impl Write, question: &str) -> io::Result<bool> {
     for ask in 0..ASKS {
         if ask > 0 {
@@ -20,11 +25,10 @@ pub fn confirm(input: &mut impl BufRead, output: &mut impl Write, question: &str
         }
         write!(output, "{question}")?;
         output.flush()?;
-        let mut line = String::new();
-        if input.read_line(&mut line)? == 0 {
+        let Some(line) = read_answer(input)? else {
             writeln!(output)?;
             return Ok(false);
-        }
+        };
         match line.trim().to_ascii_lowercase().as_str() {
             "" | "y" | "yes" => return Ok(true),
             "n" | "no" => return Ok(false),
@@ -39,9 +43,10 @@ pub fn confirm(input: &mut impl BufRead, output: &mut impl Write, question: &str
 /// add, by number or name in any case, separated by spaces or commas. Returns
 /// the chosen names as `optional` spells them, in `optional` order.
 ///
-/// Enter chooses none. An answer naming anything else asks again, up to
-/// [`ASKS`] times in all, and then counts as none. End of input counts as
-/// none.
+/// Enter chooses none. An answer naming anything else, or not UTF-8, asks
+/// again, up to [`ASKS`] times in all, and then counts as none. End of input
+/// counts as none. The rejected word is echoed with control characters
+/// escaped, so a typed escape sequence is shown rather than run.
 pub fn pick(
     input: &mut impl BufRead, output: &mut impl Write, essential: &[&str], optional: &[&str],
 ) -> io::Result<Vec<String>> {
@@ -53,18 +58,31 @@ pub fn pick(
     for ask in 0..ASKS {
         write!(output, "{PICK_QUESTION}")?;
         output.flush()?;
-        let mut line = String::new();
-        if input.read_line(&mut line)? == 0 {
+        let Some(line) = read_answer(input)? else {
             writeln!(output)?;
             return Ok(Vec::new());
-        }
+        };
         match chosen(&line, optional) {
             Ok(picked) => return Ok(picked),
-            Err(word) if ask + 1 < ASKS => writeln!(output, "no optional tool {word}")?,
+            Err(word) if ask + 1 < ASKS => writeln!(output, "no optional tool {}", word.escape_debug())?,
             Err(_) => {}
         }
     }
     Ok(Vec::new())
+}
+
+/// Reads one line of answer, or `None` at end of input. Keeps at most
+/// [`LINE_BYTES`] bytes and discards the rest of a longer line. Bytes that are
+/// not UTF-8 become U+FFFD, so they make a wrong answer instead of an error.
+fn read_answer(input: &mut impl BufRead) -> io::Result<Option<String>> {
+    let mut line = Vec::new();
+    if Read::take(&mut *input, LINE_BYTES).read_until(b'\n', &mut line)? == 0 {
+        return Ok(None);
+    }
+    if line.len() as u64 == LINE_BYTES && line.last() != Some(&b'\n') {
+        input.skip_until(b'\n')?;
+    }
+    Ok(Some(String::from_utf8_lossy(&line).into_owned()))
 }
 
 /// The tools of `optional` that `line` names by number or name, in
@@ -94,7 +112,7 @@ fn chosen(line: &str, optional: &[&str]) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PICK_QUESTION, confirm, pick};
+    use super::{LINE_BYTES, PICK_QUESTION, confirm, pick};
 
     const QUESTION: &str = "Install these? [Y/n] ";
 
@@ -142,10 +160,34 @@ mod tests {
         assert!(!output.ends_with("answer y or n\n"));
     }
 
+    #[test]
+    fn an_answer_that_is_not_utf8_asks_again() {
+        let mut output = Vec::new();
+        let yes = confirm(&mut &b"\xff\xfe\ny\n"[..], &mut output, QUESTION).unwrap();
+        assert!(yes);
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            format!("{QUESTION}answer y or n\n{QUESTION}")
+        );
+    }
+
+    #[test]
+    fn the_rest_of_an_over_long_line_is_discarded() {
+        let typed = format!("{}\nno\n", "x".repeat(LINE_BYTES as usize * 2));
+        let (yes, output) = answer(&typed);
+        assert!(!yes);
+        assert_eq!(output, format!("{QUESTION}answer y or n\n{QUESTION}"));
+    }
+
     /// The tools chosen and what the picker wrote for `typed`.
     fn picked(typed: &str) -> (Vec<String>, String) {
+        picked_bytes(typed.as_bytes())
+    }
+
+    /// The tools chosen and what the picker wrote for the bytes `typed`.
+    fn picked_bytes(mut typed: &[u8]) -> (Vec<String>, String) {
         let mut output = Vec::new();
-        let picked = pick(&mut typed.as_bytes(), &mut output, &["fab", "arcl"], &["mire", "dalil"]).unwrap();
+        let picked = pick(&mut typed, &mut output, &["fab", "arcl"], &["mire", "dalil"]).unwrap();
         (picked, String::from_utf8(output).unwrap())
     }
 
@@ -177,6 +219,20 @@ mod tests {
             format!("{LIST}{PICK_QUESTION}no optional tool fab\n{PICK_QUESTION}")
         );
         assert_eq!(picked("0\n1\n").0, ["mire"]);
+    }
+
+    #[test]
+    fn a_pick_that_is_not_utf8_asks_again() {
+        let again = format!("{LIST}{PICK_QUESTION}no optional tool \u{FFFD}\n{PICK_QUESTION}");
+        assert_eq!(picked_bytes(b"\xff\n2\n"), (vec!["dalil".to_owned()], again));
+    }
+
+    #[test]
+    fn a_wrong_pick_is_echoed_with_control_characters_escaped() {
+        let (picked, output) = picked("\x1b]0;x\x07\n\n");
+        assert!(picked.is_empty());
+        assert!(!output.contains(['\x1b', '\x07']), "{output:?}");
+        assert!(output.contains("no optional tool \\u{1b}]0;x\\u{7}\n"), "{output:?}");
     }
 
     #[test]
