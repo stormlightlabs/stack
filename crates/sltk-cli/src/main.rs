@@ -69,13 +69,15 @@ enum Command {
     /// Report what is wrong with the installed tools. Changes nothing.
     ///
     /// Checks fab and arcl, and each optional tool that .github/sltk.toml
-    /// lists, or, outside a repository with a pin, each one installed. It
-    /// reports a tool missing from the bin directory, a version other than
-    /// the train's, a binary PATH finds before the bin directory's, and
-    /// whether that one is Homebrew's, a bin directory missing from PATH,
-    /// and a pin of another sltk release. Exits 0 when nothing is wrong, 1
-    /// when something is, and 2 when it could not check, as when the pin
-    /// cannot be read.
+    /// lists, or, without a pin, each one installed. It looks for the pin
+    /// from the current directory up to the root of its git repository, and
+    /// reads none outside a repository. It reports a tool missing from the
+    /// bin directory, a version other than the train's, a binary PATH finds
+    /// before the bin directory's, and whether that one is Homebrew's, a bin
+    /// directory missing from PATH, a pin of another sltk release, and a pin
+    /// it will not read: a symlink, not a regular file, or over 64 KiB.
+    /// Exits 0 when nothing is wrong, 1 when something is, and 2 when it
+    /// could not check, as when the pin cannot be read or parsed.
     Doctor,
 }
 

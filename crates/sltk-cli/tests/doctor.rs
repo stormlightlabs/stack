@@ -118,3 +118,22 @@ fn a_pin_of_another_release_is_a_finding_and_exits_1() {
         )
     );
 }
+
+#[test]
+fn a_pin_outside_any_repository_is_not_read() {
+    let (root, _repo, cargo_home) = setup();
+    let bin = cargo_home.join("bin");
+    fake_essentials(&bin);
+    // Not UTF-8, so reading it would exit 2.
+    std::fs::create_dir_all(root.path().join(".github")).unwrap();
+    std::fs::write(root.path().join(".github/sltk.toml"), [0xff, 0xfe]).unwrap();
+    let outside = root.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let output = doctor(&outside, &cargo_home, &bin);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}

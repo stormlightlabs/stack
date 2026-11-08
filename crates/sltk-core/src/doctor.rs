@@ -10,7 +10,7 @@ use std::fmt;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use crate::pin::{self, Pin, PinError};
@@ -28,6 +28,14 @@ const BREW_PREFIXES: [&str; 3] = ["/opt/homebrew", "/usr/local/Cellar", "/home/l
 
 /// How often doctor checks whether `<binary> --version` has exited.
 const POLL: Duration = Duration::from_millis(10);
+
+/// How long doctor keeps reading `<binary> --version` once the binary has
+/// exited. A background process it started may hold stdout open; doctor stops
+/// reading after this and uses what it has.
+const EXIT_GRACE: Duration = Duration::from_millis(200);
+
+/// The largest `.github/sltk.toml` doctor reads.
+const MAX_PIN_BYTES: u64 = 64 * 1024;
 
 /// How many times doctor starts a binary that the OS reports busy, as when an
 /// install is still writing it.
@@ -87,6 +95,12 @@ pub enum Finding {
         /// This binary's release.
         running: String,
     },
+    /// The repository's pin is a symlink, not a regular file, or too large,
+    /// so doctor did not read it.
+    PinRefused {
+        /// Why, as ".github/sltk.toml is a symlink".
+        reason: String,
+    },
 }
 
 impl fmt::Display for Finding {
@@ -114,6 +128,7 @@ impl fmt::Display for Finding {
                 "{}: pins sltk {pinned}, but this is sltk {running}; doctor checks the tools sltk {running} pins",
                 pin::PATH
             ),
+            Finding::PinRefused { reason } => write!(f, "{reason}; doctor read no pin"),
         }
     }
 }
@@ -129,6 +144,19 @@ pub enum RepoPin {
         /// The release `.github/sltk.toml` pins.
         version: String,
     },
+    /// A pin doctor would not read, and why.
+    Refused {
+        /// Why, as ".github/sltk.toml is a symlink".
+        reason: String,
+    },
+}
+
+/// What [`read_pin_text`] found at `.github/sltk.toml`.
+enum PinText {
+    /// The pin's text.
+    Read(String),
+    /// Why doctor would not read it.
+    Refused(String),
 }
 
 /// What doctor reads from the machine.
@@ -171,9 +199,10 @@ pub struct Report {
 /// Checks the tools `train` lists on `machine`.
 ///
 /// The essentials are always checked. With a pin of this release, so are the
-/// optional tools it lists. A pin of another release than `running` is a
-/// finding, and doctor then treats the repository as unpinned: an optional
-/// tool is checked only when the bin directory has it.
+/// optional tools it lists. A pin of another release than `running`, or one
+/// doctor refused to read, is a finding, and doctor then treats the
+/// repository as unpinned: an optional tool is checked only when the bin
+/// directory has it.
 pub fn check(train: &Train, pin: Option<&RepoPin>, running: &str, machine: &Machine) -> Report {
     let mut report = Report { checked: Vec::new(), findings: Vec::new() };
     let pin = match pin {
@@ -182,6 +211,10 @@ pub fn check(train: &Train, pin: Option<&RepoPin>, running: &str, machine: &Mach
             report
                 .findings
                 .push(Finding::PinVersion { pinned: version.clone(), running: running.to_owned() });
+            None
+        }
+        Some(RepoPin::Refused { reason }) => {
+            report.findings.push(Finding::PinRefused { reason: reason.clone() });
             None
         }
         None => None,
@@ -197,65 +230,64 @@ pub fn check(train: &Train, pin: Option<&RepoPin>, running: &str, machine: &Mach
     report
 }
 
-/// The repository root at or above `start` that holds `.github/sltk.toml`.
-/// The search stops at the first directory holding `.git`, so a repository
-/// never takes the pin of one it sits inside.
+/// The nearest directory at or above `start` that has a `.github/sltk.toml`,
+/// searching no higher than the root of the git repository `start` is in.
+/// That root is the nearest directory holding a `.git` entry, a directory in
+/// a clone and a file in a worktree, so a repository never takes the pin of
+/// one it sits inside. Outside a repository there is no pin. The pin is found
+/// without following a symlink at its own path; [`read_pin`] refuses one.
 pub fn find_pin_root(start: &Path) -> Option<PathBuf> {
-    for dir in start.ancestors() {
-        if dir.join(pin::PATH).is_file() {
-            return Some(dir.to_owned());
-        }
-        if dir.join(".git").exists() {
-            return None;
-        }
-    }
-    None
+    let repo = start.ancestors().find(|dir| exists(&dir.join(".git")))?;
+    start
+        .ancestors()
+        .take(start.ancestors().position(|dir| dir == repo)? + 1)
+        .find(|dir| exists(&dir.join(pin::PATH)))
+        .map(Path::to_owned)
 }
 
-/// Reads `.github/sltk.toml` under `root`. When its version line names a
-/// release other than `running`, only that version is read, since the rest
-/// follows another train. Otherwise the whole pin is read against `train`,
-/// and a pin without a version line fails as [`Pin::parse`] says.
+/// Reads `.github/sltk.toml` under `root`. When `.github` or the pin is a
+/// symlink, the pin is not a regular file, or it is larger than 64 KiB, the
+/// pin is [`RepoPin::Refused`]. When its version line names a release other
+/// than `running`, only that version is read, since the rest follows another
+/// train. Otherwise the whole pin is read against `train`, and a pin without a
+/// version line fails as [`Pin::parse`] says.
 pub fn read_pin(root: &Path, train: &Train, running: &str) -> Result<RepoPin, PinError> {
-    let path = root.join(pin::PATH);
-    let text = std::fs::read_to_string(&path).map_err(|source| PinError::Io { path, source })?;
+    let text = match read_pin_text(root)? {
+        PinText::Read(text) => text,
+        PinText::Refused(reason) => return Ok(RepoPin::Refused { reason }),
+    };
     match pin::read_version(&text) {
         Some(version) if version != running => Ok(RepoPin::Other { version: version.to_owned() }),
         _ => Pin::parse(&text, train).map(RepoPin::Current),
     }
 }
 
-/// The first `x.y.z` in `text`: three runs of digits joined by dots, not
-/// preceded by a digit or a dot. `fab 0.8.0+c5fa630` gives `0.8.0`.
-pub fn parse_version(text: &str) -> Option<&str> {
-    let bytes = text.as_bytes();
-    let digits = |from: usize| bytes[from..].iter().take_while(|b| b.is_ascii_digit()).count();
-    for start in 0..bytes.len() {
-        let after_other = start == 0 || !(bytes[start - 1].is_ascii_digit() || bytes[start - 1] == b'.');
-        if !after_other || !bytes[start].is_ascii_digit() {
-            continue;
-        }
-        let mut end = start;
-        let mut runs = 0;
-        while runs < 3 {
-            let n = digits(end);
-            if n == 0 {
-                break;
-            }
-            end += n;
-            runs += 1;
-            if runs < 3 {
-                if bytes.get(end) != Some(&b'.') {
-                    break;
-                }
-                end += 1;
-            }
-        }
-        if runs == 3 {
-            return Some(&text[start..end]);
-        }
+/// The version in `<binary> --version` output, in the form fab and arcl print
+/// it: a first line of two words, `binary` then `x.y.z`, with optional build
+/// metadata after a `+`. `fab 0.8.0+c5fa630` gives `0.8.0`. A prerelease such
+/// as `0.8.0-rc.1`, a fourth part, another first word, or more words is not a
+/// version.
+pub fn parse_version<'a>(text: &'a str, binary: &str) -> Option<&'a str> {
+    let mut words = text.lines().next()?.split_whitespace();
+    if words.next()? != binary {
+        return None;
     }
-    None
+    let word = words.next()?;
+    if words.next().is_some() {
+        return None;
+    }
+    let (version, build) = match word.split_once('+') {
+        Some((version, build)) => (version, Some(build)),
+        None => (word, None),
+    };
+    let numeric = |part: &str| {
+        !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) && (part == "0" || !part.starts_with('0'))
+    };
+    let identifier = |id: &str| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    let parts: Vec<&str> = version.split('.').collect();
+    let core = parts.len() == 3 && parts.iter().all(|part| numeric(part));
+    let build_ok = build.is_none_or(|build| build.split('.').all(identifier));
+    (core && build_ok).then_some(version)
 }
 
 /// Whether doctor checks `tool`: always for an essential, else when the pin
@@ -275,7 +307,12 @@ fn check_tool(tool: &Tool, machine: &Machine, findings: &mut Vec<Finding>) {
         findings.push(Finding::Missing { tool: tool.name.clone(), path: pinned.clone() });
     } else {
         match run_version(&pinned, machine.timeout) {
-            Ok(output) => match parse_version(&output) {
+            Ok(output) if output.trim().is_empty() => findings.push(Finding::NoVersion {
+                tool: tool.name.clone(),
+                path: pinned.clone(),
+                reason: "it exited without printing a version".to_owned(),
+            }),
+            Ok(output) => match parse_version(&output, &tool.binary) {
                 Some(found) if found == tool.version => {}
                 Some(found) => findings.push(Finding::WrongVersion {
                     tool: tool.name.clone(),
@@ -286,7 +323,7 @@ fn check_tool(tool: &Tool, machine: &Machine, findings: &mut Vec<Finding>) {
                 None => findings.push(Finding::NoVersion {
                     tool: tool.name.clone(),
                     path: pinned.clone(),
-                    reason: "no x.y.z in its output".to_owned(),
+                    reason: "unrecognised version output".to_owned(),
                 }),
             },
             Err(reason) => findings.push(Finding::NoVersion { tool: tool.name.clone(), path: pinned.clone(), reason }),
@@ -351,50 +388,165 @@ fn is_homebrew(path: &Path, prefixes: &[PathBuf]) -> bool {
     })
 }
 
+/// Whether anything, a symlink included, is at `path`.
+fn exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// The text of `.github/sltk.toml` under `root`, or why doctor refuses it:
+/// `.github` or the pin is a symlink, the pin is not a regular file, or it is
+/// larger than [`MAX_PIN_BYTES`]. An error reading it is a [`PinError::Io`].
+fn read_pin_text(root: &Path) -> Result<PinText, PinError> {
+    let io = |path: PathBuf| move |source| PinError::Io { path, source };
+    let github = root.join(".github");
+    let path = root.join(pin::PATH);
+    for (entry, dir) in [(&github, true), (&path, false)] {
+        let meta = std::fs::symlink_metadata(entry).map_err(io(entry.clone()))?;
+        let name = entry.strip_prefix(root).unwrap_or(entry).display();
+        if meta.file_type().is_symlink() {
+            return Ok(PinText::Refused(format!("{name} is a symlink")));
+        }
+        if dir && !meta.is_dir() {
+            return Ok(PinText::Refused(format!("{name} is not a directory")));
+        }
+        if !dir && !meta.is_file() {
+            return Ok(PinText::Refused(format!("{name} is not a regular file")));
+        }
+    }
+    let file = open_no_follow(&path).map_err(io(path.clone()))?;
+    let meta = file.metadata().map_err(io(path.clone()))?;
+    if !meta.is_file() {
+        return Ok(PinText::Refused(format!("{} is not a regular file", pin::PATH)));
+    }
+    let mut text = String::new();
+    file.take(MAX_PIN_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(io(path.clone()))?;
+    if text.len() as u64 > MAX_PIN_BYTES {
+        return Ok(PinText::Refused(format!("{} is larger than 64 KiB", pin::PATH)));
+    }
+    Ok(PinText::Read(text))
+}
+
+/// Opens `path` to read, failing if it is a symlink, and without blocking if
+/// it has become a FIFO since it was checked.
+fn open_no_follow(path: &Path) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use rustix::fs::OFlags;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags((OFlags::NOFOLLOW | OFlags::NONBLOCK).bits() as i32);
+    }
+    options.open(path)
+}
+
 /// Runs `<binary> --version` and returns what it wrote to stdout, up to
-/// [`MAX_VERSION_OUTPUT`] bytes. Stops the binary after `timeout`.
+/// [`MAX_VERSION_OUTPUT`] bytes.
+///
+/// The binary runs in a process group of its own. Once it exits, doctor reads
+/// for up to [`EXIT_GRACE`] more and uses what it has, since a background
+/// process the binary started may hold stdout open. If it has not exited
+/// after `timeout`, that is the error. Either way doctor then kills the whole
+/// group. A process that left the group, as with `setsid`, can still hold
+/// the pipe; the reading thread then waits on it until sltk exits.
 fn run_version(binary: &Path, timeout: Duration) -> Result<String, String> {
     let mut child = spawn_version(binary).map_err(|err| format!("could not run it: {err}"))?;
     let stdout = child.stdout.take().expect("stdout is piped");
-    let (send, receive) = mpsc::channel();
-    // The thread ends when the binary closes stdout or the cap is reached. A
-    // binary that never does leaves it blocked on the pipe until sltk exits.
+    let read = Arc::new(Mutex::new(Vec::new()));
+    let (send, done) = mpsc::channel();
+    let shared = Arc::clone(&read);
     std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = stdout.take(MAX_VERSION_OUTPUT).read_to_end(&mut bytes).map(|_| bytes);
-        let _ = send.send(result);
+        let _ = send.send(read_capped(stdout, &shared));
     });
-    let deadline = Instant::now() + timeout;
-    let output = receive.recv_timeout(timeout);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("it did not exit within {} s", timeout.as_secs_f32()));
-            }
-        }
+    let exited = wait_for_exit(&mut child, Instant::now() + timeout);
+    let mut result = done.recv_timeout(if exited { EXIT_GRACE } else { Duration::ZERO });
+    kill_group(&mut child);
+    let _ = child.wait();
+    if !exited {
+        return Err(format!("it did not exit within {} s", timeout.as_secs_f32()));
     }
-    match output {
-        Ok(Ok(bytes)) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
-        Ok(Err(err)) => Err(format!("could not read its output: {err}")),
-        Err(_) => Err(format!("it did not exit within {} s", timeout.as_secs_f32())),
+    if result.is_err() {
+        // The kill closes the pipe for every process in the group, so the
+        // thread may now finish what is buffered.
+        result = done.recv_timeout(EXIT_GRACE);
+    }
+    if let Ok(Err(err)) = result {
+        return Err(format!("could not read its output: {err}"));
+    }
+    let bytes = read.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Reads `from` into `into` until end of file or [`MAX_VERSION_OUTPUT`]
+/// bytes, appending as it goes so a caller that stops waiting still has what
+/// was read.
+fn read_capped(mut from: impl Read, into: &Mutex<Vec<u8>>) -> io::Result<()> {
+    let mut buf = [0; 512];
+    let mut total = 0;
+    while total < MAX_VERSION_OUTPUT {
+        let want = buf.len().min((MAX_VERSION_OUTPUT - total) as usize);
+        let n = match from.read(&mut buf[..want]) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        into.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend_from_slice(&buf[..n]);
+        total += n as u64;
+    }
+    Ok(())
+}
+
+/// Waits until `child` exits or `deadline` passes, and says whether it
+/// exited. On Unix the child is left unreaped, so its process group ID cannot
+/// be reused before [`kill_group`] signals it.
+fn wait_for_exit(child: &mut std::process::Child, deadline: Instant) -> bool {
+    loop {
+        #[cfg(unix)]
+        let status = {
+            use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+            let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+            waitid(WaitId::Pid(Pid::from_child(child)), options).map(|status| status.is_some())
+        };
+        #[cfg(not(unix))]
+        let status = child.try_wait().map(|status| status.is_some());
+        match status {
+            Ok(true) => return true,
+            Ok(false) if Instant::now() < deadline => std::thread::sleep(POLL),
+            _ => return false,
+        }
     }
 }
 
-/// Starts `<binary> --version` with stdout piped, retrying while the OS
-/// reports the file busy.
+/// Kills every process in `child`'s process group on Unix, then `child`
+/// itself, in case it moved to another group.
+fn kill_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        use rustix::process::{Pid, Signal, kill_process_group};
+        let _ = kill_process_group(Pid::from_child(child), Signal::KILL);
+    }
+    let _ = child.kill();
+}
+
+/// Starts `<binary> --version` with stdout piped, in a process group of its
+/// own on Unix, retrying while the OS reports the file busy.
 fn spawn_version(binary: &Path) -> io::Result<std::process::Child> {
     let mut attempt = 1;
     loop {
-        let result = Command::new(binary)
+        let mut command = Command::new(binary);
+        command
             .arg("--version")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn();
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let result = command.spawn();
         match result {
             Err(err) if err.kind() == io::ErrorKind::ExecutableFileBusy && attempt < BUSY_ATTEMPTS => {
                 attempt += 1;
@@ -586,8 +738,60 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
         let report = fixture.check(None, &["cargo/bin"]);
         assert_eq!(
             report.findings,
-            [Finding::NoVersion { tool: "arcl".into(), path: arcl, reason: "no x.y.z in its output".into() }]
+            [Finding::NoVersion { tool: "arcl".into(), path: arcl, reason: "unrecognised version output".into() }]
         );
+    }
+
+    #[test]
+    fn a_binary_that_prints_nothing_is_reported() {
+        let fixture = Fixture::new();
+        fixture.good();
+        let arcl = fixture.bin().join("arcl");
+        std::fs::write(&arcl, "#!/bin/sh\nexit 0\n").unwrap();
+        let report = fixture.check(None, &["cargo/bin"]);
+        assert_eq!(
+            report.findings,
+            [Finding::NoVersion {
+                tool: "arcl".into(),
+                path: arcl,
+                reason: "it exited without printing a version".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_background_process_holding_stdout_does_not_hold_doctor() {
+        let fixture = Fixture::new();
+        fixture.good();
+        // fab prints its version, starts a process that keeps stdout open and
+        // writes its pid, waits for the pid, then exits.
+        let pid_file = fixture.dir("other/pid");
+        let script = format!(
+            "#!/bin/sh\nprintf 'fab 0.8.0\\n'\nsh -c 'echo $$ > {pid}; exec sleep 3' &\n\
+             while [ ! -s {pid} ]; do sleep 0.01; done\nexit 0\n",
+            pid = pid_file.display()
+        );
+        std::fs::write(fixture.bin().join("fab"), script).unwrap();
+        let started = std::time::Instant::now();
+        let report = fixture.check(None, &["cargo/bin"]);
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert_eq!(report.findings, []);
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let pid = pid.trim();
+        // Killed, it is gone, or a zombie until init reaps it.
+        let gone = (0..50).any(|_| {
+            let ps = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", pid])
+                .output()
+                .unwrap();
+            let stat = String::from_utf8_lossy(&ps.stdout);
+            let stat = stat.trim();
+            stat.is_empty() || stat.starts_with('Z') || {
+                std::thread::sleep(Duration::from_millis(20));
+                false
+            }
+        });
+        assert!(gone, "process {pid} still runs");
     }
 
     #[test]
@@ -765,14 +969,96 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
     }
 
     #[test]
-    fn the_first_x_y_z_is_the_version() {
-        assert_eq!(parse_version("fab 0.8.0+c5fa630"), Some("0.8.0"));
-        assert_eq!(parse_version("arcl 0.3.0\n"), Some("0.3.0"));
-        assert_eq!(parse_version("tool v10.20.30-rc.1"), Some("10.20.30"));
-        assert_eq!(parse_version("build 2 of 1.2 then 4.5.6"), Some("4.5.6"));
-        assert_eq!(parse_version("1.2.3.4"), Some("1.2.3"));
-        assert_eq!(parse_version("x 1.2."), None);
-        assert_eq!(parse_version(""), None);
+    fn the_version_is_the_word_after_the_binary_name() {
+        assert_eq!(parse_version("fab 0.8.0+c5fa630", "fab"), Some("0.8.0"));
+        assert_eq!(parse_version("arcl 0.3.0\n", "arcl"), Some("0.3.0"));
+        assert_eq!(parse_version("fab 10.20.30+build.1-x\nmore\n", "fab"), Some("10.20.30"));
+        for text in [
+            "fab 0.8.0-rc.1",
+            "fab 0.8.0.1",
+            "fab 0.8",
+            "fab 0.8.0+",
+            "fab 0.8.0+a..b",
+            "fab 0.8.0+c5f_a63",
+            "fab v0.8.0",
+            "fab 0.08.0",
+            "fab 0.8.0 (c5fa630)",
+            "arcl 0.8.0",
+            "built with rustc 1.97.0\nfab 0.8.0",
+            "fab\n0.8.0",
+            "",
+        ] {
+            assert_eq!(parse_version(text, "fab"), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_pin_above_any_repository_is_ignored() {
+        let root = tempfile::tempdir().unwrap();
+        write_pin(root.path(), "");
+        let deep = root.path().join("a/b");
+        std::fs::create_dir_all(&deep).unwrap();
+        assert_eq!(find_pin_root(&deep), None);
+        assert_eq!(find_pin_root(root.path()), None);
+        // Nor does a repository below it take it.
+        std::fs::create_dir_all(deep.join(".git")).unwrap();
+        assert_eq!(find_pin_root(&deep), None);
+    }
+
+    #[test]
+    fn a_symlinked_pin_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join(".github")).unwrap();
+        let elsewhere = root.path().join("pin.toml");
+        std::fs::write(&elsewhere, "version = \"9.9.9\"\n").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, repo.join(".github/sltk.toml")).unwrap();
+        assert_eq!(find_pin_root(&repo).as_deref(), Some(repo.as_path()));
+        let train = Train::parse(TRAIN).unwrap();
+        let refused = read_pin(&repo, &train, "0.2.0").unwrap();
+        assert_eq!(
+            refused,
+            RepoPin::Refused { reason: ".github/sltk.toml is a symlink".into() }
+        );
+        let fixture = Fixture::new();
+        fixture.good();
+        let report = fixture.check(Some(&refused), &["cargo/bin"]);
+        assert_eq!(
+            report.findings.iter().map(|f| f.to_string()).collect::<Vec<_>>(),
+            [".github/sltk.toml is a symlink; doctor read no pin"]
+        );
+    }
+
+    #[test]
+    fn a_pin_that_is_not_a_small_regular_file_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let train = Train::parse(TRAIN).unwrap();
+        let read = |text: &str| {
+            write_pin(root.path(), text);
+            read_pin(root.path(), &train, "0.2.0").unwrap()
+        };
+        let big = format!("version = \"9.9.9\"\n{}", "#".repeat(64 * 1024));
+        assert_eq!(
+            read(&big),
+            RepoPin::Refused { reason: ".github/sltk.toml is larger than 64 KiB".into() }
+        );
+        std::fs::remove_file(root.path().join(".github/sltk.toml")).unwrap();
+        std::fs::create_dir(root.path().join(".github/sltk.toml")).unwrap();
+        assert_eq!(
+            read_pin(root.path(), &train, "0.2.0").unwrap(),
+            RepoPin::Refused { reason: ".github/sltk.toml is not a regular file".into() }
+        );
+        // A symlinked .github is refused too.
+        let other = tempfile::tempdir().unwrap();
+        write_pin(other.path(), "version = \"9.9.9\"\n");
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::os::unix::fs::symlink(other.path().join(".github"), repo.join(".github")).unwrap();
+        assert_eq!(
+            read_pin(&repo, &train, "0.2.0").unwrap(),
+            RepoPin::Refused { reason: ".github is a symlink".into() }
+        );
     }
 
     #[test]
