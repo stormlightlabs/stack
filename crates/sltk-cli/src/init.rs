@@ -349,7 +349,7 @@ mod tests {
         let result = run_adopt(&train, &adopt, yes, terminal, &mut typed.as_bytes(), &mut output);
         let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
         if !yes && (result != Ok(0)) {
-            assert_eq!(calls, "arcl skill install --check\n");
+            assert_eq!(calls, "fab check\narcl skill install --check\n");
         }
         (result, String::from_utf8(output).unwrap(), files(&root) != before)
     }

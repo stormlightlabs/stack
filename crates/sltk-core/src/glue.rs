@@ -5,8 +5,13 @@
 //! them. Each writer leaves a file alone when it already holds what it would
 //! write, so a second run changes no byte. None follows a symlink, whether
 //! it is the file or a directory between the repository root and the file,
-//! so every write lands inside the repository. Every file is checked before
-//! any is written, so a refusal changes nothing.
+//! so every write lands inside the repository. The one exception is an
+//! AGENTS.md or CLAUDE.md that links to the other: the Tasks section goes in
+//! the file it links to. Every file is checked before any is written, so a
+//! refusal changes nothing.
+//!
+//! The Markdown scans follow CommonMark's code fences: a heading or a marker
+//! line inside a fence is code, not structure.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -28,11 +33,6 @@ pub const SETTINGS: &str = ".claude/settings.json";
 /// The command the SessionStart entry runs.
 /// The variable is quoted so a project path with a space stays one word.
 pub const HOOK_COMMAND: &str = "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session-start.sh";
-
-/// The command a hand-copied SessionStart entry runs for the same hook,
-/// without the quotes. The settings writer rewrites it to [`HOOK_COMMAND`]
-/// rather than add a second entry that would run the hook twice.
-pub const UNQUOTED_HOOK_COMMAND: &str = "$CLAUDE_PROJECT_DIR/.claude/hooks/session-start.sh";
 
 /// The line that opens the Tasks section in AGENTS.md.
 pub const TASKS_BEGIN: &str = "<!-- sltk:tasks:begin -->";
@@ -95,6 +95,25 @@ pub struct Change {
     /// The Unix permission bits it gets, or `None` to leave them to the
     /// umask.
     pub mode: Option<u32>,
+}
+
+/// An open code fence: the character its opening line repeats, and how many
+/// times. Only a line of the same character, at least as long, closes it.
+#[derive(Debug, Clone, Copy)]
+struct Fence {
+    mark: u8,
+    len: usize,
+}
+
+/// One line of a Markdown file, as [`scan`] reads it.
+#[derive(Debug)]
+struct Line<'a> {
+    /// The byte offset where the line starts.
+    start: usize,
+    /// The line, with its ending.
+    text: &'a str,
+    /// Whether the line opens, closes or lies inside a code fence.
+    fenced: bool,
 }
 
 /// Writes the Tasks section, the hook and its settings entry under `root`,
@@ -164,10 +183,10 @@ pub fn tasks_file(root: &Path) -> Result<&'static str, GlueError> {
         }
     }
     if kind_or_link(&root.join(AGENTS))? {
-        return Ok(AGENTS);
+        return Ok(follow_link(root, AGENTS));
     }
     if kind_or_link(&root.join(CLAUDE))? {
-        return Ok(CLAUDE);
+        return Ok(follow_link(root, CLAUDE));
     }
     Ok(AGENTS)
 }
@@ -186,15 +205,47 @@ pub fn tasks_section(existing: Option<&str>) -> Result<String, String> {
 /// markers and one `## Tasks` heading has that section replaced in place:
 /// the heading line up to the next line outside a code fence that is a
 /// heading of level one or two or starts an HTML comment, or the end of the
-/// file.
+/// file. Adoption also refuses a heading of level one or two outside the
+/// markers that reads as Tasks in any case, with or without more text, but
+/// is not `## Tasks`, since sltk would leave it beside its own section.
+///
+/// Both policies refuse a file with a code fence that nothing closes:
+/// CommonMark reads the rest of the file as code, so a section sltk writes
+/// after it would be code too.
 pub fn tasks_section_with(existing: Option<&str>, policy: Existing) -> Result<String, String> {
     let section = format!("{TASKS_BEGIN}\n{TASKS}{TASKS_END}\n");
     let Some(text) = existing.filter(|text| !text.is_empty()) else {
         return Ok(section);
     };
-    let begins = marker_lines(text, TASKS_BEGIN);
-    let ends = marker_lines(text, TASKS_END);
-    let headings = tasks_headings(text);
+    let (lines, unclosed) = scan(text);
+    if let Some(number) = unclosed {
+        return Err(format!(
+            "opens a code fence on line {number} that nothing closes, so the rest of the file reads as \
+             code. Close the fence and rerun sltk init"
+        ));
+    }
+    let begins = marker_lines(&lines, TASKS_BEGIN);
+    let ends = marker_lines(&lines, TASKS_END);
+    let headings = tasks_headings(&lines);
+    if policy == Existing::Replace {
+        let (from, to) = match (begins.as_slice(), ends.as_slice()) {
+            ([begin], [end]) if begin < end => (*begin, *end),
+            _ => (0, 0),
+        };
+        let near: Vec<String> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| !line.fenced && (line.start < from || line.start >= to) && near_tasks(line.text))
+            .map(|(i, line)| format!("line {} ({})", i + 1, line.text.trim()))
+            .collect();
+        if !near.is_empty() {
+            return Err(format!(
+                "has a Tasks heading that is not ## Tasks at {}, so sltk would add a second Tasks section. \
+                 Rename it to ## Tasks for sltk to replace, or give it another name",
+                near.join(", ")
+            ));
+        }
+    }
     let heading_outside = |from: usize, to: usize| headings.iter().any(|&at| at < from || at >= to);
     let two_sections = || {
         format!(
@@ -206,7 +257,7 @@ pub fn tasks_section_with(existing: Option<&str>, policy: Existing) -> Result<St
     match (begins.as_slice(), ends.as_slice()) {
         ([], []) if policy == Existing::Replace && headings.len() == 1 => {
             let start = headings[0];
-            let end = section_end(text, start);
+            let end = section_end(&lines, start).unwrap_or(text.len());
             let gap = if end < text.len() { "\n" } else { "" };
             Ok(format!("{}{section}{gap}{}", &text[..start], &text[end..]))
         }
@@ -240,9 +291,11 @@ pub fn tasks_section_with(existing: Option<&str>, policy: Existing) -> Result<St
 /// `.claude/settings.json` with the hook's SessionStart entry, or `None`
 /// when `existing` already runs [`HOOK_COMMAND`] at SessionStart. A missing
 /// file becomes [`SETTINGS_TEMPLATE`]. An existing file keeps its other keys
-/// and hooks in their order and gains the entry at the end of
-/// `hooks.SessionStart`, unless an entry there runs
-/// [`UNQUOTED_HOOK_COMMAND`]: that entry gets [`HOOK_COMMAND`] in place.
+/// and hooks in their order. When one SessionStart entry already runs
+/// [`HOOK`], in any form, such as `${CLAUDE_PROJECT_DIR}/...`, `bash "..."`
+/// or with arguments, that entry gets [`HOOK_COMMAND`] in place; otherwise
+/// the entry goes at the end of `hooks.SessionStart`. More than one such
+/// entry is refused, since the hook would run more than once.
 ///
 /// The new text is serde_json's, not an edit of the old bytes: it is
 /// indented with two spaces, a repeated key keeps only its last value, and
@@ -267,26 +320,26 @@ pub fn settings(existing: Option<&str>) -> Result<Option<String>, String> {
         .or_insert_with(|| serde_json::Value::Array(Vec::new()))
         .as_array_mut()
         .ok_or("hooks.SessionStart is not a JSON array")?;
-    let mut rewrote = false;
-    for hook in start
+    let mut found: Vec<&mut serde_json::Value> = start
         .iter_mut()
         .filter_map(|group| group.get_mut("hooks").and_then(serde_json::Value::as_array_mut))
         .flatten()
-    {
-        if hook["command"] == UNQUOTED_HOOK_COMMAND {
-            hook["command"] = serde_json::Value::from(HOOK_COMMAND);
-            rewrote = true;
+        .filter(|hook| hook["command"].as_str().is_some_and(runs_hook))
+        .collect();
+    match found.as_mut_slice() {
+        [] => {}
+        [hook] if hook["command"] == HOOK_COMMAND => return Ok(None),
+        [hook] => hook["command"] = serde_json::Value::from(HOOK_COMMAND),
+        many => {
+            let commands: Vec<String> = many.iter().map(|hook| hook["command"].to_string()).collect();
+            return Err(format!(
+                "has {} SessionStart entries that run {HOOK}: {}. Delete all but one and rerun sltk init",
+                many.len(),
+                commands.join(", ")
+            ));
         }
     }
-    let runs_hook = start.iter().any(|group| {
-        group["hooks"]
-            .as_array()
-            .is_some_and(|list| list.iter().any(|hook| hook["command"] == HOOK_COMMAND))
-    });
-    if runs_hook && !rewrote {
-        return Ok(None);
-    }
-    if !runs_hook {
+    if found.is_empty() {
         start.push(entry);
     }
     let mut out = serde_json::to_string_pretty(&root).expect("a JSON value serializes");
@@ -294,64 +347,165 @@ pub fn settings(existing: Option<&str>) -> Result<Option<String>, String> {
     Ok(Some(out))
 }
 
-/// The byte offsets of the lines in `text` that are a `## Tasks` heading,
-/// ignoring indentation, closing `#`s and a `\r\n` ending.
-fn tasks_headings(text: &str) -> Vec<usize> {
-    let mut offsets = Vec::new();
-    let mut start = 0;
-    for line in text.split_inclusive('\n') {
-        let heading = line
-            .trim()
-            .strip_prefix("## ")
-            .map(|rest| rest.trim_end_matches('#').trim());
-        if heading == Some("Tasks") {
-            offsets.push(start);
-        }
-        start += line.len();
-    }
-    offsets
+/// The byte offsets of the lines outside code fences that are a `## Tasks`
+/// heading, ignoring up to three spaces of indentation, closing `#`s and a
+/// `\r\n` ending.
+fn tasks_headings(lines: &[Line]) -> Vec<usize> {
+    lines
+        .iter()
+        .filter(|line| !line.fenced && heading(line.text) == Some((2, "Tasks")))
+        .map(|line| line.start)
+        .collect()
 }
 
 /// The byte offset where the section whose heading starts at `start` ends:
 /// the next line, outside a code fence, that is a heading of level one or
-/// two or starts an HTML comment, or the end of `text`. A comment line ends
-/// it because another tool's marker, such as `<!-- fabrial:begin -->`, can
-/// open the block that follows, and replacing the marker would lose it.
-fn section_end(text: &str, start: usize) -> usize {
-    let mut at = start;
-    let mut fenced = false;
-    for (i, line) in text[start..].split_inclusive('\n').enumerate() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            fenced = !fenced;
-        } else if i > 0 && !fenced {
-            if trimmed.starts_with("<!--") {
-                return at;
-            }
-            let level = trimmed.bytes().take_while(|&b| b == b'#').count();
-            let rest = &trimmed[level..];
-            if (level == 1 || level == 2) && (rest.is_empty() || rest.starts_with(char::is_whitespace)) {
-                return at;
-            }
-        }
-        at += line.len();
-    }
-    text.len()
+/// two or starts an HTML comment, or `None` at the end of the file. A
+/// comment line ends it because another tool's marker, such as
+/// `<!-- fabrial:begin -->`, can open the block that follows, and replacing
+/// the marker would lose it.
+fn section_end(lines: &[Line], start: usize) -> Option<usize> {
+    lines
+        .iter()
+        .filter(|line| line.start > start && !line.fenced)
+        .find(|line| {
+            line.text.trim_start().starts_with("<!--") || heading(line.text).is_some_and(|(level, _)| level <= 2)
+        })
+        .map(|line| line.start)
 }
 
-/// The byte offsets of the lines in `text` that are exactly `marker`, ignoring
-/// a `\n` or `\r\n` ending.
-fn marker_lines(text: &str, marker: &str) -> Vec<usize> {
-    let mut offsets = Vec::new();
+/// The byte offsets of the lines outside code fences that are exactly
+/// `marker`, ignoring a `\n` or `\r\n` ending.
+fn marker_lines(lines: &[Line], marker: &str) -> Vec<usize> {
+    lines
+        .iter()
+        .filter(|line| !line.fenced && trim_ending(line.text) == marker)
+        .map(|line| line.start)
+        .collect()
+}
+
+/// The lines of `text`, each marked as fenced or not, and the number,
+/// counting from one, of the line that opens a fence nothing closes. As in
+/// CommonMark, a fence opens with three or more backticks or tildes after
+/// at most three spaces, and an unclosed fence runs to the end of the file.
+fn scan(text: &str) -> (Vec<Line<'_>>, Option<usize>) {
+    let mut lines = Vec::new();
+    let mut open: Option<(Fence, usize)> = None;
     let mut start = 0;
-    for line in text.split_inclusive('\n') {
-        let line_text = line.strip_suffix('\n').unwrap_or(line);
-        if line_text.strip_suffix('\r').unwrap_or(line_text) == marker {
-            offsets.push(start);
-        }
+    for (i, line) in text.split_inclusive('\n').enumerate() {
+        let fenced = match open {
+            Some((fence, _)) => {
+                if fence_closes(line, fence) {
+                    open = None;
+                }
+                true
+            }
+            None => {
+                open = fence_opens(line).map(|fence| (fence, i + 1));
+                open.is_some()
+            }
+        };
+        lines.push(Line { start, text: line, fenced });
         start += line.len();
     }
-    offsets
+    (lines, open.map(|(_, number)| number))
+}
+
+/// The fence `line` opens: three or more backticks or tildes after at most
+/// three spaces. A backtick fence's info string holds no backtick.
+fn fence_opens(line: &str) -> Option<Fence> {
+    let rest = indented(trim_ending(line))?;
+    let mark = *rest.as_bytes().first()?;
+    if mark != b'`' && mark != b'~' {
+        return None;
+    }
+    let len = rest.bytes().take_while(|&b| b == mark).count();
+    if len < 3 || (mark == b'`' && rest[len..].contains('`')) {
+        return None;
+    }
+    Some(Fence { mark, len })
+}
+
+/// Whether `line` closes `fence`: after at most three spaces, at least as
+/// many of its character, then nothing but spaces or tabs.
+fn fence_closes(line: &str, fence: Fence) -> bool {
+    let Some(rest) = indented(trim_ending(line)) else {
+        return false;
+    };
+    let len = rest.bytes().take_while(|&b| b == fence.mark).count();
+    len >= fence.len && rest[len..].bytes().all(|b| b == b' ' || b == b'\t')
+}
+
+/// The level and text of the ATX heading on `line`: one to six `#`s after
+/// at most three spaces, then a space, a tab or the end of the line. The
+/// text has its closing `#`s and the spaces around it removed.
+fn heading(line: &str) -> Option<(usize, &str)> {
+    let rest = indented(trim_ending(line))?;
+    let level = rest.bytes().take_while(|&b| b == b'#').count();
+    let rest = &rest[level..];
+    if !(1..=6).contains(&level) || !(rest.is_empty() || rest.starts_with([' ', '\t'])) {
+        return None;
+    }
+    let text = rest.trim();
+    let open = text.trim_end_matches('#');
+    if open.is_empty() || open.ends_with([' ', '\t']) {
+        return Some((level, open.trim_end()));
+    }
+    Some((level, text))
+}
+
+/// Whether `line` is a heading of level one or two that reads as Tasks in
+/// any case, alone or before more text, other than `## Tasks` itself.
+fn near_tasks(line: &str) -> bool {
+    let Some((level, text)) = heading(line) else {
+        return false;
+    };
+    let lower = text.to_lowercase();
+    let starts = lower
+        .strip_prefix("tasks")
+        .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric()));
+    level <= 2 && starts && (level, text) != (2, "Tasks")
+}
+
+/// Whether a SessionStart command runs [`HOOK`]: the path appears in it,
+/// not as part of a longer name.
+fn runs_hook(command: &str) -> bool {
+    let part = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.');
+    command.match_indices(HOOK).any(|(at, _)| {
+        let before = command[..at].chars().next_back();
+        let after = command[at + HOOK.len()..].chars().next();
+        !before.is_some_and(part) && !after.is_some_and(|c| part(c) || c == '/')
+    })
+}
+
+/// `line` after up to three leading spaces, or `None` when it has four or
+/// more, which make it indented code.
+fn indented(line: &str) -> Option<&str> {
+    let spaces = line.bytes().take_while(|&b| b == b' ').count();
+    (spaces <= 3).then(|| &line[spaces..])
+}
+
+/// `line` without its `\n` or `\r\n` ending.
+fn trim_ending(line: &str) -> &str {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    line.strip_suffix('\r').unwrap_or(line)
+}
+
+/// `relative`, one of [`AGENTS`] and [`CLAUDE`], or the other of the two
+/// when `relative` is a symlink to it and it is a regular file in `root`.
+/// Any other symlink stays as it is, and [`read`] refuses it.
+fn follow_link(root: &Path, relative: &'static str) -> &'static str {
+    let other = if relative == AGENTS { CLAUDE } else { AGENTS };
+    let Ok(target) = std::fs::read_link(root.join(relative)) else {
+        return relative;
+    };
+    let other_path = root.join(other);
+    let same = match (root.join(target).canonicalize(), other_path.canonicalize()) {
+        (Ok(target), Ok(other)) => target == other,
+        _ => false,
+    };
+    let regular = std::fs::symlink_metadata(&other_path).is_ok_and(|meta| meta.is_file());
+    if same && regular { other } else { relative }
 }
 
 /// The text of the file at `relative` under `root`, or `None` when there is
@@ -456,7 +610,8 @@ fn holds_marker(root: &Path, relative: &str) -> Result<bool, GlueError> {
         Ok(meta) if !meta.is_file() => Ok(false),
         Ok(_) => {
             let bytes = std::fs::read(&path).map_err(|source| GlueError::Io { path, source })?;
-            Ok(!marker_lines(&String::from_utf8_lossy(&bytes), TASKS_BEGIN).is_empty())
+            let text = String::from_utf8_lossy(&bytes);
+            Ok(!marker_lines(&scan(&text).0, TASKS_BEGIN).is_empty())
         }
     }
 }
@@ -473,9 +628,18 @@ fn kind_or_link(path: &Path) -> Result<bool, GlueError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Existing, HOOK_COMMAND, SETTINGS_TEMPLATE, TASKS, TASKS_BEGIN, TASKS_END, UNQUOTED_HOOK_COMMAND, settings,
+        AGENTS, CLAUDE, Existing, HOOK_COMMAND, SETTINGS_TEMPLATE, TASKS, TASKS_BEGIN, TASKS_END, settings, tasks_file,
         tasks_section, tasks_section_with,
     };
+
+    /// Settings whose one SessionStart group runs `commands`.
+    fn settings_running(commands: &[&str]) -> String {
+        let hooks: Vec<serde_json::Value> = commands
+            .iter()
+            .map(|command| serde_json::json!({"type": "command", "command": command, "timeout": 60}))
+            .collect();
+        serde_json::json!({"hooks": {"SessionStart": [{"hooks": hooks}]}}).to_string()
+    }
 
     fn section() -> String {
         format!("{TASKS_BEGIN}\n{TASKS}{TASKS_END}\n")
@@ -591,18 +755,140 @@ mod tests {
     }
 
     #[test]
-    fn an_unquoted_entry_for_the_hook_is_quoted_in_place() {
-        let text = format!(
-            r#"{{"hooks": {{"SessionStart": [{{"hooks": [{{"type": "command", "command": "a.sh"}}, {{"type": "command", "command": "{}"}}]}}]}}}}"#,
-            UNQUOTED_HOOK_COMMAND
+    fn any_entry_for_the_hook_is_replaced_in_place() {
+        for command in [
+            "$CLAUDE_PROJECT_DIR/.claude/hooks/session-start.sh",
+            "${CLAUDE_PROJECT_DIR}/.claude/hooks/session-start.sh",
+            "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/session-start.sh\"",
+            "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session-start.sh --quiet",
+            ".claude/hooks/session-start.sh",
+        ] {
+            let got = settings(Some(&settings_running(&["a.sh", command]))).unwrap().unwrap();
+            let value: serde_json::Value = serde_json::from_str(&got).unwrap();
+            let start = value["hooks"]["SessionStart"].as_array().unwrap();
+            assert_eq!(start.len(), 1, "{command}");
+            assert_eq!(start[0]["hooks"].as_array().unwrap().len(), 2, "{command}");
+            assert_eq!(start[0]["hooks"][0]["command"], "a.sh");
+            assert_eq!(start[0]["hooks"][1]["command"], HOOK_COMMAND, "{command}");
+            assert_eq!(start[0]["hooks"][1]["timeout"], 60, "{command}");
+            assert_eq!(settings(Some(&got)).unwrap(), None, "{command}");
+        }
+    }
+
+    #[test]
+    fn a_command_naming_another_file_is_not_the_hook() {
+        for command in [
+            "$CLAUDE_PROJECT_DIR/.claude/hooks/session-start.sh.bak",
+            "$CLAUDE_PROJECT_DIR/x.claude/hooks/session-start.sh",
+            "$CLAUDE_PROJECT_DIR/.claude/hooks/session-start.sh/run",
+        ] {
+            let got = settings(Some(&settings_running(&[command]))).unwrap().unwrap();
+            let value: serde_json::Value = serde_json::from_str(&got).unwrap();
+            let start = value["hooks"]["SessionStart"].as_array().unwrap();
+            assert_eq!(start.len(), 2, "{command}");
+            assert_eq!(start[0]["hooks"][0]["command"], command);
+            assert_eq!(start[1]["hooks"][0]["command"], HOOK_COMMAND);
+        }
+    }
+
+    #[test]
+    fn two_entries_for_the_hook_are_refused_and_named() {
+        let text = settings_running(&[HOOK_COMMAND, "bash .claude/hooks/session-start.sh"]);
+        let err = settings(Some(&text)).unwrap_err();
+        assert_eq!(
+            err,
+            "has 2 SessionStart entries that run .claude/hooks/session-start.sh: \
+             \"\\\"$CLAUDE_PROJECT_DIR\\\"/.claude/hooks/session-start.sh\", \
+             \"bash .claude/hooks/session-start.sh\". Delete all but one and rerun sltk init"
         );
-        let got = settings(Some(&text)).unwrap().unwrap();
-        let value: serde_json::Value = serde_json::from_str(&got).unwrap();
-        let start = value["hooks"]["SessionStart"].as_array().unwrap();
-        assert_eq!(start.len(), 1);
-        assert_eq!(start[0]["hooks"][0]["command"], "a.sh");
-        assert_eq!(start[0]["hooks"][1]["command"], HOOK_COMMAND);
-        assert_eq!(settings(Some(&got)).unwrap(), None);
+    }
+
+    #[test]
+    fn a_fence_closes_only_on_its_own_character_at_its_length_or_longer() {
+        let replace = |text: &str| tasks_section_with(Some(text), Existing::Replace);
+        let after = "<!-- fabrial:begin -->\n## B\n<!-- fabrial:end -->\n";
+        // A tilde line inside a backtick fence, a shorter backtick line, and
+        // a backtick line with text after it close nothing; the longer
+        // closing fence does.
+        let body = "````md\n~~~\n## not a heading\n```\n```` not closed\n## nor this\n`````  \n\n";
+        let got = replace(&format!("## Tasks\n\n{body}{after}")).unwrap();
+        assert_eq!(got, format!("{}\n{after}", section()));
+        let body = "~~~\n```\n<!-- in a fence -->\n~~~\n\n";
+        let got = replace(&format!("## Tasks\n\n{body}{after}")).unwrap();
+        assert_eq!(got, format!("{}\n{after}", section()));
+    }
+
+    #[test]
+    fn an_unclosed_fence_is_refused() {
+        for policy in [Existing::Refuse, Existing::Replace] {
+            let text = "# A\n\n## Tasks\n\n```sh\nold\n~~~\n## B\n";
+            let err = tasks_section_with(Some(text), policy).unwrap_err();
+            assert_eq!(
+                err,
+                "opens a code fence on line 5 that nothing closes, so the rest of the file reads as code. \
+                 Close the fence and rerun sltk init"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tasks_heading_or_marker_inside_a_fence_is_code() {
+        let text = format!("# A\n\nExample:\n\n```md\n## Tasks\n{TASKS_BEGIN}\n```\n\n## B\n");
+        let want = format!("{text}\n{}", section());
+        assert_eq!(tasks_section(Some(&text)).unwrap(), want);
+        assert_eq!(tasks_section_with(Some(&text), Existing::Replace).unwrap(), want);
+        // Four spaces make indented code, not a heading.
+        let text = "# A\n\n    ## Tasks\n";
+        assert!(tasks_section(Some(text)).is_ok());
+    }
+
+    #[test]
+    fn adoption_refuses_a_tasks_heading_that_is_not_exactly_level_two() {
+        for (text, line) in [
+            ("# A\n\n## Tasks (arcl)\n\nold\n", "line 3 (## Tasks (arcl))"),
+            ("# A\n\n## tasks\n", "line 3 (## tasks)"),
+            ("# Tasks\n", "line 1 (# Tasks)"),
+            ("# A\n\n## TASKS ##\n", "line 3 (## TASKS ##)"),
+            ("## Tasks\n\n## Tasks and bugs\n", "line 3 (## Tasks and bugs)"),
+        ] {
+            let err = tasks_section_with(Some(text), Existing::Replace).unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "has a Tasks heading that is not ## Tasks at {line}, so sltk would add a second Tasks \
+                     section. Rename it to ## Tasks for sltk to replace, or give it another name"
+                ),
+                "{text:?}"
+            );
+        }
+        let marked = format!("# A\n\n{TASKS_BEGIN}\n## Tasks (old)\n{TASKS_END}\n");
+        for text in [
+            "# A\n\n### Tasks\n",
+            "# A\n\n## Taskset\n",
+            "# A\n\n```\n## tasks\n```\n",
+            marked.as_str(),
+        ] {
+            assert!(tasks_section_with(Some(text), Existing::Replace).is_ok(), "{text:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_between_agents_and_claude_is_followed_to_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(CLAUDE), "# A\n").unwrap();
+        std::os::unix::fs::symlink(CLAUDE, root.join(AGENTS)).unwrap();
+        assert_eq!(tasks_file(root).unwrap(), CLAUDE);
+        std::fs::remove_file(root.join(AGENTS)).unwrap();
+        std::fs::rename(root.join(CLAUDE), root.join(AGENTS)).unwrap();
+        std::os::unix::fs::symlink(root.join(AGENTS), root.join(CLAUDE)).unwrap();
+        assert_eq!(tasks_file(root).unwrap(), AGENTS);
+        // A link to any other file stays, for the reader to refuse.
+        std::fs::remove_file(root.join(CLAUDE)).unwrap();
+        std::fs::rename(root.join(AGENTS), root.join("NOTES.md")).unwrap();
+        std::os::unix::fs::symlink("NOTES.md", root.join(AGENTS)).unwrap();
+        assert_eq!(tasks_file(root).unwrap(), AGENTS);
     }
 
     #[test]

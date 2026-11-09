@@ -204,7 +204,7 @@ fn planning_shows_the_diff_and_changes_no_byte() {
     let adoption = fakes.plan().unwrap();
     let text = adoption.describe();
     assert_eq!(tree(&fakes.root), before);
-    assert_eq!(fakes.calls(), ["skill install --check"]);
+    assert_eq!(fakes.calls(), ["check", "skill install --check"]);
 
     assert!(
         text.starts_with(
@@ -254,7 +254,10 @@ fn applying_replaces_the_hook_and_tasks_section_then_runs_fab_update_and_the_ski
          running arcl skill install\n\
          wrote .github/sltk.toml\n"
     );
-    assert_eq!(fakes.calls(), ["skill install --check", "update", "skill install"]);
+    assert_eq!(
+        fakes.calls(),
+        ["check", "skill install --check", "update", "skill install"]
+    );
     assert_eq!(
         fakes.read(glue::AGENTS),
         format!(
@@ -273,7 +276,7 @@ fn applying_replaces_the_hook_and_tasks_section_then_runs_fab_update_and_the_ski
     let settings = fakes.read(glue::SETTINGS);
     let quoted = serde_json::to_string(glue::HOOK_COMMAND).unwrap();
     assert_eq!(settings.matches(&quoted).count(), 1, "{settings}");
-    assert!(!settings.contains(glue::UNQUOTED_HOOK_COMMAND), "{settings}");
+    assert!(!settings.contains("\"$CLAUDE_PROJECT_DIR/"), "{settings}");
     assert_eq!(fakes.read(FAB_SETTINGS), FAB_TOML);
     assert_eq!(Pin::read(&fakes.root, &train()).unwrap(), pin);
     assert_eq!(pin.version, "1.2.3");
@@ -292,7 +295,13 @@ fn skill_files_that_match_are_not_installed_again() {
     fakes.adopt().0.unwrap();
     assert_eq!(
         fakes.calls(),
-        ["skill install --check", "skill install --check", "update"]
+        [
+            "check",
+            "skill install --check",
+            "check",
+            "skill install --check",
+            "update"
+        ]
     );
 }
 
@@ -362,7 +371,7 @@ fn a_rerun_keeps_the_tasks_section_in_claude_md_after_fab_update_writes_agents_m
     let agents = format!("# AGENTS.md\n\n{AFTER}");
     write_script(
         &fakes.bin.join("fab"),
-        &format!("#!/bin/sh\nprintf '%s' '{agents}' > AGENTS.md\n"),
+        &format!("#!/bin/sh\n[ \"$1\" = update ] && printf '%s' '{agents}' > AGENTS.md\nexit 0\n"),
     );
     write_script(
         &fakes.bin.join("arcl"),
@@ -449,4 +458,85 @@ fn a_non_executable_hook_shows_its_mode_change() {
     std::fs::set_permissions(fakes.root.join(glue::HOOK), std::fs::Permissions::from_mode(0o644)).unwrap();
     let text = fakes.plan().unwrap().describe();
     assert!(text.contains("\nmode 644 -> 755\n"), "{text}");
+}
+
+#[test]
+fn a_missing_fab_or_arcl_stops_the_plan_before_any_change() {
+    for program in ["fab", "arcl"] {
+        let fakes = Fakes::new(0, 0);
+        std::fs::remove_file(fakes.bin.join(program)).unwrap();
+        let before = tree(&fakes.root);
+        let err = fakes.plan().unwrap_err();
+        assert!(
+            matches!(&err, SetupError::NoProgram { program: p } if p == program),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "sltk: {program} is not in an absolute PATH directory, and sltk init runs it to adopt this \
+                 repository. Install it with sltk install and rerun sltk init; sltk changed nothing"
+            )
+        );
+        assert_eq!(tree(&fakes.root), before);
+        assert!(fakes.calls().is_empty(), "{:?}", fakes.calls());
+    }
+}
+
+#[test]
+fn the_plan_lists_the_files_fab_check_reports_for_fab_update_to_rewrite() {
+    let fakes = Fakes::new(0, 0);
+    write_script(
+        &fakes.bin.join("fab"),
+        "#!/bin/sh\n[ \"$1\" = check ] || exit 9\n\
+         echo 'differs: .github/workflows/branch-pr.yml'\necho 'missing: .claude/agents/reviser.md'\nexit 1\n",
+    );
+    let before = tree(&fakes.root);
+    let text = fakes.plan().unwrap().describe();
+    assert_eq!(tree(&fakes.root), before);
+    assert!(
+        text.contains(
+            "  fab update\n\
+             fab update will rewrite these files, which fab check reports as drifted:\n  \
+             .github/workflows/branch-pr.yml\n  .claude/agents/reviser.md\nIt writes these files:\n"
+        ),
+        "{text}"
+    );
+
+    // No drift lists nothing, and a failure stops the plan.
+    write_script(
+        &fakes.bin.join("fab"),
+        "#!/bin/sh\necho 'fabrial 0.8.0 is installed with no drift.'\n",
+    );
+    let text = fakes.plan().unwrap().describe();
+    assert!(!text.contains("fab check"), "{text}");
+    write_script(&fakes.bin.join("fab"), "#!/bin/sh\nexit 2\n");
+    let err = fakes.plan().unwrap_err().to_string();
+    assert_eq!(err, "sltk: fab check failed with exit status: 2; sltk changed nothing");
+    assert_eq!(tree(&fakes.root), before);
+}
+
+#[test]
+fn an_agents_md_linked_to_claude_md_has_the_section_written_to_claude_md() {
+    let fakes = Fakes::new(0, 0);
+    std::fs::rename(fakes.root.join(glue::AGENTS), fakes.root.join(glue::CLAUDE)).unwrap();
+    std::os::unix::fs::symlink(glue::CLAUDE, fakes.root.join(glue::AGENTS)).unwrap();
+    fakes.adopt().0.unwrap();
+    let link = std::fs::read_link(fakes.root.join(glue::AGENTS)).unwrap();
+    assert_eq!(link, Path::new(glue::CLAUDE));
+    let text = fakes.read(glue::CLAUDE);
+    assert!(text.starts_with(&format!("{BEFORE}{}\n", glue::TASKS_BEGIN)), "{text}");
+    assert!(text.ends_with(&format!("{}\n\n{AFTER}", glue::TASKS_END)), "{text}");
+}
+
+#[test]
+fn a_tasks_heading_only_in_a_code_block_leaves_the_file_whole() {
+    let fakes = Fakes::new(0, 0);
+    let text = format!("{BEFORE}Example:\n\n~~~md\n## Tasks\n```\nnot closed by that\n~~~\n\n{AFTER}");
+    std::fs::write(fakes.root.join(glue::AGENTS), &text).unwrap();
+    fakes.adopt().0.unwrap();
+    assert_eq!(
+        fakes.read(glue::AGENTS),
+        format!("{text}\n{}\n{}{}\n", glue::TASKS_BEGIN, glue::TASKS, glue::TASKS_END)
+    );
 }

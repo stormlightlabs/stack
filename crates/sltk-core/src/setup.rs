@@ -14,7 +14,7 @@
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Output, Stdio};
 
 use crate::glue::{self, GlueError};
 use crate::install::Fetch;
@@ -154,6 +154,12 @@ pub enum SetupError {
     /// that means a skill file is missing or differs.
     #[error("sltk: {command} failed with {status}; sltk changed nothing")]
     Check { command: String, status: ExitStatus },
+    /// A program adoption runs is not on `PATH`.
+    #[error(
+        "sltk: {program} is not in an absolute PATH directory, and sltk init runs it to adopt this repository. \
+             Install it with sltk install and rerun sltk init; sltk changed nothing"
+    )]
+    NoProgram { program: String },
     /// A file changed between the diff adoption showed and the write.
     #[error("sltk: {} changed after sltk showed the diff; sltk changed nothing, so rerun sltk init", path.display())]
     Changed { path: PathBuf },
@@ -435,19 +441,16 @@ pub fn find_program(name: &str, path: Option<&OsStr>) -> Option<PathBuf> {
 /// [`find_program`] on `path`, or on the `PATH` `sltk` runs with when `path`
 /// is `None`, and the command gets `path` as its `PATH` when given.
 pub fn run(command: &[String], root: &Path, path: Option<&OsStr>) -> std::io::Result<ExitStatus> {
-    let search = path.map(OsStr::to_owned).or_else(|| std::env::var_os("PATH"));
-    let program = find_program(&command[0], search.as_deref()).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("no executable file named {} in an absolute PATH directory", command[0]),
-        )
-    })?;
-    let mut process = Command::new(program);
-    process.args(&command[1..]).current_dir(root);
-    if let Some(path) = path {
-        process.env("PATH", path);
-    }
-    process.status()
+    prepare(command, root, path)?.status()
+}
+
+/// [`run`], with the command's standard output captured and returned with
+/// its status. Its standard error still goes to `sltk`'s.
+pub fn run_captured(command: &[String], root: &Path, path: Option<&OsStr>) -> std::io::Result<Output> {
+    prepare(command, root, path)?
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output()
 }
 
 /// A path git printed on its own line, from its raw bytes. On Unix any bytes
@@ -470,6 +473,23 @@ pub fn path_from_git(mut stdout: Vec<u8>) -> Result<PathBuf, String> {
             .map(PathBuf::from)
             .map_err(|_| "git printed a path that is not UTF-8".to_owned())
     }
+}
+
+/// The process [`run`] and [`run_captured`] start, not yet started.
+fn prepare(command: &[String], root: &Path, path: Option<&OsStr>) -> std::io::Result<Command> {
+    let search = path.map(OsStr::to_owned).or_else(|| std::env::var_os("PATH"));
+    let program = find_program(&command[0], search.as_deref()).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no executable file named {} in an absolute PATH directory", command[0]),
+        )
+    })?;
+    let mut process = Command::new(program);
+    process.args(&command[1..]).current_dir(root);
+    if let Some(path) = path {
+        process.env("PATH", path);
+    }
+    Ok(process)
 }
 
 /// Whether `command` is the train's `fab init`.

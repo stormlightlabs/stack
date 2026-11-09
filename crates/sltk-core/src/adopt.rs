@@ -2,9 +2,12 @@
 //! `.github/fabrial.toml` and no pin.
 //!
 //! [`plan`] works out every change before any is made: the glue files sltk
-//! replaces, shown as a diff, the pin, and the commands that write the
-//! tools' own files. Planning runs `arcl skill install --check`, which writes
-//! nothing, to learn whether `arcl skill install` is needed. [`apply`] then
+//! replaces, shown as a diff, the pin, the commands that write the tools'
+//! own files, and the files `fab check` reports as drifted, which `fab
+//! update` rewrites. Planning first checks that every program it runs is on
+//! `PATH`, then runs `fab check` and `arcl skill install --check`, which
+//! write nothing, the second to learn whether `arcl skill install` is
+//! needed. [`apply`] then
 //! writes the glue, runs the commands, and writes the pin last, so a failed
 //! adoption leaves no pin and a rerun adopts again.
 //!
@@ -23,6 +26,13 @@ use crate::train::Train;
 
 /// The command that refreshes fab's files and keeps its settings.
 pub const FAB_UPDATE: [&str; 2] = ["fab", "update"];
+
+/// The command that reports, writing nothing, each file of fab's that
+/// differs from what [`FAB_UPDATE`] would write, one per line.
+pub const FAB_CHECK: [&str; 2] = ["fab", "check"];
+
+/// The exit code of [`FAB_CHECK`] when it reports drift.
+pub const FAB_DRIFT: i32 = 1;
 
 /// The command that sets up arcl's workspace, run only when the repository
 /// has no `.arcl` directory.
@@ -73,6 +83,10 @@ pub struct Adoption {
     /// The commands run after the glue is written, each as its program and
     /// arguments.
     pub commands: Vec<Vec<String>>,
+    /// What [`FAB_CHECK`] reported, which [`FAB_UPDATE`] rewrites: the
+    /// paths it named, or its lines as it printed them when one did not
+    /// have the form [`drift`] reads.
+    pub drift: Vec<String>,
 }
 
 impl Adoption {
@@ -85,6 +99,12 @@ impl Adoption {
         );
         for command in &self.commands {
             out.push_str(&format!("  {}\n", setup::command_line(command)));
+        }
+        if !self.drift.is_empty() {
+            out.push_str("fab update will rewrite these files, which fab check reports as drifted:\n");
+            for line in &self.drift {
+                out.push_str(&format!("  {line}\n"));
+            }
         }
         out.push_str("It writes these files:\n");
         for change in &self.glue {
@@ -112,14 +132,22 @@ pub fn adopting(root: &Path) -> Result<bool, SetupError> {
 }
 
 /// Works out the adoption of `root` without changing it. Reads fab's
-/// settings and checks the given flags against them, reads this release's
-/// archive hashes for the pin, plans the glue, and runs [`SKILL_CHECK`].
+/// settings and checks the given flags against them, checks that fab and
+/// arcl are on `PATH`, reads this release's archive hashes for the pin,
+/// plans the glue, and runs [`FAB_CHECK`] and [`SKILL_CHECK`].
 pub fn plan(train: &Train, version: &str, adopt: &Adopt) -> Result<Adoption, SetupError> {
     let pin_path = adopt.root.join(pin::PATH);
     if std::fs::symlink_metadata(&pin_path).is_ok() {
         return Err(SetupError::PinExists { path: pin_path });
     }
     check_settings(adopt)?;
+    // Every command below and in apply runs fab or arcl.
+    let search = adopt.path.map(OsStr::to_owned).or_else(|| std::env::var_os("PATH"));
+    for program in ["fab", "arcl"] {
+        if setup::find_program(program, search.as_deref()).is_none() {
+            return Err(SetupError::NoProgram { program: program.to_owned() });
+        }
+    }
     let mut sha256 = std::collections::BTreeMap::new();
     for platform in pin::TARGETS {
         let hash = adopt.hashes.sha256(platform).map_err(|message| SetupError::Hash {
@@ -138,20 +166,31 @@ pub fn plan(train: &Train, version: &str, adopt: &Adopt) -> Result<Adoption, Set
     if std::fs::symlink_metadata(adopt.root.join(".arcl")).is_err() {
         commands.push(owned(&ARCL_INIT));
     }
-    let check = owned(&SKILL_CHECK);
-    let line = setup::command_line(&check);
-    let status = setup::run(&check, adopt.root, adopt.path).map_err(|source| SetupError::Spawn {
-        command: line.clone(),
+    let spawn = |line: &str, source| SetupError::Spawn {
+        command: line.to_owned(),
         dir: adopt.root.to_owned(),
         source,
         progress: Progress { ran: Vec::new(), not_run: Vec::new() },
-    })?;
+    };
+
+    let check = owned(&FAB_CHECK);
+    let line = setup::command_line(&check);
+    let output = setup::run_captured(&check, adopt.root, adopt.path).map_err(|source| spawn(&line, source))?;
+    let drift = match output.status.code() {
+        Some(0) => Vec::new(),
+        Some(FAB_DRIFT) => drift(&String::from_utf8_lossy(&output.stdout)),
+        _ => return Err(SetupError::Check { command: line, status: output.status }),
+    };
+
+    let check = owned(&SKILL_CHECK);
+    let line = setup::command_line(&check);
+    let status = setup::run(&check, adopt.root, adopt.path).map_err(|source| spawn(&line, source))?;
     match status.code() {
         Some(0) => {}
         Some(SKILL_DIFFERS) => commands.push(owned(&SKILL_INSTALL)),
         _ => return Err(SetupError::Check { command: line, status }),
     }
-    Ok(Adoption { glue, pin, pin_text, commands })
+    Ok(Adoption { glue, pin, pin_text, commands, drift })
 }
 
 /// Carries out `adoption`, which [`plan`] made for `adopt`: checks that no
@@ -236,6 +275,37 @@ pub fn diff(path: &str, old: Option<&str>, new: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// The drift `report`, the output of [`FAB_CHECK`], names. fab 0.8.0 prints
+/// one line per drifted file, `missing: <path>` or `differs: <path>`, and
+/// `version: ...` when its settings name another fab, which `fab update`
+/// fixes in [`FAB_SETTINGS`]. When every line has one of these forms the
+/// list holds the paths, each once; otherwise it holds the report's lines
+/// as they are, so nothing fab printed is lost.
+pub fn drift(report: &str) -> Vec<String> {
+    let lines: Vec<&str> = report
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let mut paths: Vec<String> = Vec::new();
+    for line in &lines {
+        let path = if let Some(path) = line
+            .strip_prefix("missing: ")
+            .or_else(|| line.strip_prefix("differs: "))
+        {
+            path
+        } else if line.starts_with("version: ") {
+            FAB_SETTINGS
+        } else {
+            return lines.iter().map(|line| line.to_string()).collect();
+        };
+        if !paths.iter().any(|seen| seen == path) {
+            paths.push(path.to_owned());
+        }
+    }
+    paths
 }
 
 /// Checks that fab's settings file can be read and holds the value of each
@@ -328,7 +398,30 @@ fn line_ops<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<(char, &'a str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::diff;
+    use super::{diff, drift};
+
+    #[test]
+    fn drift_lists_each_path_fab_check_names_once() {
+        let report = "differs: .github/workflows/branch-pr.yml\nmissing: .claude/agents/reviser.md\n\
+                      differs: AGENTS.md's fabrial section\nversion: installed 0.7.0, this build 0.8.0\n\
+                      differs: .github/workflows/branch-pr.yml\n";
+        assert_eq!(
+            drift(report),
+            [
+                ".github/workflows/branch-pr.yml",
+                ".claude/agents/reviser.md",
+                "AGENTS.md's fabrial section",
+                ".github/fabrial.toml"
+            ]
+        );
+        assert!(drift("").is_empty());
+    }
+
+    #[test]
+    fn drift_keeps_a_report_it_cannot_read_as_printed() {
+        let report = "differs: a.md\nsomething new: b.md\n";
+        assert_eq!(drift(report), ["differs: a.md", "something new: b.md"]);
+    }
 
     #[test]
     fn a_new_file_is_all_added_lines() {
