@@ -5,6 +5,10 @@
 # {archive} with the platform's archive name. Copy each sha256 from the
 # `.sha256` file dist publishes beside the archive. `setup` lists the commands
 # that set a repository up, each as its program and arguments.
+#
+# After a change to fab's version, put the new fab first on PATH and run
+# `cargo test -p sltk-core --test pinned_fab -- --ignored`. It checks that
+# fab still accepts the [tasks] table sltk appends to .github/fabrial.toml.
 
 [[tool]]
 name = "fab"

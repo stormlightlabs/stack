@@ -363,12 +363,15 @@ fn run_doctor(train: &Train) -> Result<u8, (u8, String)> {
     };
     let mut report = doctor::check(train, pin.as_ref(), sltk_core::VERSION, &machine);
     if let Some(root) = doctor::find_repo_root(&cwd) {
+        let app = doctor::read_app(root);
         match GitHub::detect(root, machine.path.as_deref(), host::HOST_TIMEOUT, host::HOST_DEADLINE) {
-            Ok(github) => {
-                let app = doctor::read_app(root);
-                doctor::check_repository(&github, app.as_ref().map_err(String::as_str), &mut report)
+            Ok(github) => doctor::check_repository(&github, app.as_ref(), &mut report),
+            Err(reason) => {
+                report
+                    .findings
+                    .extend(app.err().iter().flat_map(doctor::NoApp::findings));
+                report.notes.push(Note::Skipped { reason });
             }
-            Err(reason) => report.notes.push(Note::Skipped { reason }),
         }
     }
     print!("{}", doctor_report(&report, &machine));

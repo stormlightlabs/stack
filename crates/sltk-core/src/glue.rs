@@ -362,9 +362,8 @@ pub fn fab_tasks(existing: Option<&str>) -> Result<Option<String>, String> {
     Ok(Some(format!("{text}{gap}{FAB_TASKS}")))
 }
 
-/// The byte offsets of the lines outside code fences that are a `## Tasks`
-/// heading, ignoring up to three spaces of indentation, closing `#`s and a
-/// The [`GlueError::Content`] for `relative` under `root`.
+/// Turns a reason into the [`GlueError::Content`] naming the file at
+/// `relative` under `root`, for `map_err`.
 fn content(root: &Path, relative: &str) -> impl FnOnce(String) -> GlueError {
     let path = root.join(relative);
     move |reason| GlueError::Content { path, reason }
@@ -409,6 +408,8 @@ fn plan_fab(root: &Path) -> Result<Option<Change>, GlueError> {
     Ok(new.map(|new| Change { path: FAB_SETTINGS, old, new, old_mode: None, mode: None }))
 }
 
+/// The byte offsets of the lines outside code fences that are a `## Tasks`
+/// heading, ignoring up to three spaces of indentation, closing `#`s and a
 /// `\r\n` ending.
 fn tasks_headings(lines: &[Line]) -> Vec<usize> {
     lines

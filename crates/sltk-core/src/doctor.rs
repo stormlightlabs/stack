@@ -19,7 +19,7 @@ use std::time::Duration;
 use crate::host::{Answer, Host};
 use crate::pin::{self, Pin, PinError};
 use crate::process::run_capped;
-use crate::setup::{self, FAB_SETTINGS, LEGACY_SECRET_PREFIX};
+use crate::setup::{self, FAB_SETTINGS, Flag, LEGACY_SECRET_PREFIX};
 use crate::train::{Tier, Tool, Train};
 
 /// The endings of the two secrets fabrial's workflows read to act as the
@@ -130,6 +130,15 @@ pub enum Finding {
         /// The branch.
         branch: String,
     },
+    /// A key of fab's settings that names the App holds a value fab
+    /// refuses, so every fabrial workflow fails. Doctor then asks the host
+    /// nothing about the App or its secrets.
+    BadSetting {
+        /// The key, `app` or `secret_prefix`.
+        key: String,
+        /// What is wrong with its value, as "is not a string".
+        reason: String,
+    },
 }
 
 impl fmt::Display for Finding {
@@ -162,6 +171,12 @@ impl fmt::Display for Finding {
             Finding::AppSuspended { app, reason } => write!(f, "{app} cannot act: {reason}"),
             Finding::SecretMissing { name } => write!(f, "secret {name} is not available to this repository"),
             Finding::CheckNotRequired { check, branch } => write!(f, "{check} is not required on {branch}"),
+            Finding::BadSetting { key, reason } => {
+                write!(
+                    f,
+                    "{FAB_SETTINGS}: {key} {reason}; doctor did not check the App or its secrets"
+                )
+            }
         }
     }
 }
@@ -196,6 +211,31 @@ impl fmt::Display for Note {
             Note::Skipped { reason } => write!(f, "skipped repository checks: {reason}"),
             Note::SkippedApp { reason } => write!(f, "skipped the App and secret checks: {reason}"),
             Note::CouldNotCheck { what, reason } => write!(f, "could not check {what}: {reason}"),
+        }
+    }
+}
+
+/// Why [`read_app`] found no App to check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoApp {
+    /// fab's settings are missing, are not TOML or name no App. Doctor
+    /// skips the App and its secrets with a [`Note::SkippedApp`].
+    Absent(String),
+    /// `app` or `secret_prefix` holds a value fab refuses: each key and what
+    /// is wrong with it. Each is a [`Finding::BadSetting`].
+    Invalid(Vec<(String, String)>),
+}
+
+impl NoApp {
+    /// A [`Finding::BadSetting`] for each invalid key. Doctor reports them
+    /// whether or not it can reach the host.
+    pub fn findings(&self) -> Vec<Finding> {
+        match self {
+            NoApp::Absent(_) => Vec::new(),
+            NoApp::Invalid(keys) => keys
+                .iter()
+                .map(|(key, reason)| Finding::BadSetting { key: key.clone(), reason: reason.clone() })
+                .collect(),
         }
     }
 }
@@ -322,10 +362,12 @@ pub fn check(train: &Train, pin: Option<&RepoPin>, running: &str, machine: &Mach
 /// and [`BRANCH`] requires [`REVIEW_CHECK`]. A no or a suspension is a
 /// finding; an answer the host could not give is a [`Note::CouldNotCheck`].
 /// When `app` is the reason there is none, from [`read_app`], doctor skips
-/// the App and its secrets with a [`Note::SkippedApp`].
-pub fn check_repository(host: &dyn Host, app: Result<&App, &str>, report: &mut Report) {
+/// the App and its secrets: with a [`Note::SkippedApp`] when the settings
+/// name none, and with a [`Finding::BadSetting`] per key fab would refuse.
+pub fn check_repository(host: &dyn Host, app: Result<&App, &NoApp>, report: &mut Report) {
     report.repository = Some(host.repository());
     let mut skipped = None;
+    let mut invalid = Vec::new();
     let mut record = |answer: Answer, finding: Finding, what: String| match answer {
         Answer::Yes => {}
         Answer::No => report.findings.push(finding),
@@ -351,36 +393,53 @@ pub fn check_repository(host: &dyn Host, app: Result<&App, &str>, report: &mut R
                 );
             }
         }
-        Err(reason) => skipped = Some(Note::SkippedApp { reason: reason.to_owned() }),
+        Err(NoApp::Absent(reason)) => skipped = Some(Note::SkippedApp { reason: reason.clone() }),
+        Err(no_app) => invalid = no_app.findings(),
     }
     record(
         host.check_required(BRANCH, REVIEW_CHECK),
         Finding::CheckNotRequired { check: REVIEW_CHECK.to_owned(), branch: BRANCH.to_owned() },
         format!("whether {REVIEW_CHECK} is required on {BRANCH}"),
     );
+    report.findings.extend(invalid);
     report.notes.extend(skipped);
 }
 
 /// The App `.github/fabrial.toml` under `root` names, with its secret
-/// prefix, or why there is none: no file, no `app` key, or a file that is
-/// not TOML. Settings with no `secret_prefix` read the secrets fab 0.9.0
-/// and earlier named, [`LEGACY_SECRET_PREFIX`].
-pub fn read_app(root: &Path) -> Result<App, String> {
-    /// The keys of fab's settings that name the App.
-    #[derive(serde::Deserialize)]
-    struct Settings {
-        app: Option<String>,
-        secret_prefix: Option<String>,
-    }
+/// prefix, or why there is none. No file, no `app` key, or a file that is
+/// not TOML is [`NoApp::Absent`]. An `app` or `secret_prefix` that is not a
+/// string, or that [`Flag::check`] refuses as `sltk init` would, is
+/// [`NoApp::Invalid`], since fab refuses it too. Settings with no
+/// `secret_prefix` read the secrets fab 0.9.0 and earlier named,
+/// [`LEGACY_SECRET_PREFIX`].
+pub fn read_app(root: &Path) -> Result<App, NoApp> {
     let text = setup::read_small(&root.join(FAB_SETTINGS))
-        .map_err(|reason| format!("{FAB_SETTINGS} {reason}"))?
-        .ok_or_else(|| format!("there is no {FAB_SETTINGS}"))?;
-    let settings: Settings =
-        toml::from_str(&text).map_err(|err| format!("{FAB_SETTINGS} could not be read as TOML: {}", err.message()))?;
-    let slug = settings.app.ok_or_else(|| format!("{FAB_SETTINGS} names no app"))?;
-    let secret_prefix = settings
-        .secret_prefix
-        .unwrap_or_else(|| LEGACY_SECRET_PREFIX.to_owned());
+        .map_err(|reason| NoApp::Absent(format!("{FAB_SETTINGS} {reason}")))?
+        .ok_or_else(|| NoApp::Absent(format!("there is no {FAB_SETTINGS}")))?;
+    let settings: toml::Table = toml::from_str(&text)
+        .map_err(|err| NoApp::Absent(format!("{FAB_SETTINGS} could not be read as TOML: {}", err.message())))?;
+    let mut invalid = Vec::new();
+    let mut value = |key: &str, flag: Flag| match settings.get(key) {
+        None => None,
+        Some(toml::Value::String(value)) => match flag.check(value) {
+            Ok(()) => Some(value.clone()),
+            Err(reason) => {
+                invalid.push((key.to_owned(), reason));
+                None
+            }
+        },
+        Some(_) => {
+            invalid.push((key.to_owned(), "is not a string".to_owned()));
+            None
+        }
+    };
+    let slug = value("app", Flag::App);
+    let secret_prefix = value("secret_prefix", Flag::SecretPrefix);
+    if !invalid.is_empty() {
+        return Err(NoApp::Invalid(invalid));
+    }
+    let slug = slug.ok_or_else(|| NoApp::Absent(format!("{FAB_SETTINGS} names no app")))?;
+    let secret_prefix = secret_prefix.unwrap_or_else(|| LEGACY_SECRET_PREFIX.to_owned());
     Ok(App { slug, secret_prefix })
 }
 
@@ -618,8 +677,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        App, Finding, Machine, Note, RepoPin, Report, check, check_repository, find_pin_root, parse_version, read_app,
-        read_pin,
+        App, Finding, Machine, NoApp, Note, RepoPin, Report, check, check_repository, find_pin_root, parse_version,
+        read_app, read_pin,
     };
     use crate::host::{Answer, Host};
     use crate::pin::{Pin, PinError};
@@ -747,7 +806,7 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
         }
 
         /// What doctor finds and notes with this host for `app`.
-        fn report_for(&self, app: Result<&App, &str>) -> Report {
+        fn report_for(&self, app: Result<&App, &NoApp>) -> Report {
             let mut report = Report { checked: Vec::new(), findings: Vec::new(), repository: None, notes: Vec::new() };
             check_repository(self, app, &mut report);
             report
@@ -1281,7 +1340,7 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
         };
         assert_eq!(
             read_app(root.path()),
-            Err("there is no .github/fabrial.toml".to_owned())
+            Err(NoApp::Absent("there is no .github/fabrial.toml".to_owned()))
         );
         // The shape fab 0.9.1 writes: lists and a [tasks] table beside the keys.
         let full = "owner = \"o\"\napp = \"my-bot\"\nsecret_prefix = \"MY_BOT\"\n\
@@ -1294,19 +1353,78 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
         assert_eq!(legacy.secrets(), ["THUNDERBOT_APP_ID", "THUNDERBOT_PRIVATE_KEY"]);
         assert_eq!(
             settings("owner = \"o\"\nversion = \"0.8.0\"\n"),
-            Err(".github/fabrial.toml names no app".to_owned())
+            Err(NoApp::Absent(".github/fabrial.toml names no app".to_owned()))
         );
-        assert!(
-            settings("app = ")
-                .unwrap_err()
-                .starts_with(".github/fabrial.toml could not be read as TOML")
+        assert!(matches!(
+            settings("app = "),
+            Err(NoApp::Absent(reason)) if reason.starts_with(".github/fabrial.toml could not be read as TOML")
+        ));
+    }
+
+    #[test]
+    fn an_app_or_prefix_fab_refuses_is_invalid() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = |text: &str| {
+            std::fs::create_dir_all(root.path().join(".github")).unwrap();
+            std::fs::write(root.path().join(".github/fabrial.toml"), text).unwrap();
+            read_app(root.path())
+        };
+        let invalid = |pairs: &[(&str, &str)]| {
+            Err(NoApp::Invalid(
+                pairs
+                    .iter()
+                    .map(|(key, reason)| (key.to_string(), reason.to_string()))
+                    .collect(),
+            ))
+        };
+        let slug = "is not a GitHub App slug: lowercase letters, digits and hyphens, not at either end, up to 34 \
+                    characters";
+        let prefix = "is not a secret name prefix: uppercase letters, digits and underscores, not starting with a \
+                      digit or GITHUB_";
+        assert_eq!(settings("app = \"Not A Slug\"\n"), invalid(&[("app", slug)]));
+        assert_eq!(
+            settings("app = \"bot\"\nsecret_prefix = \"lower\"\n"),
+            invalid(&[("secret_prefix", prefix)])
+        );
+        assert_eq!(settings("app = 1\n"), invalid(&[("app", "is not a string")]));
+        assert_eq!(
+            settings("app = \"bot\"\nsecret_prefix = [\"BOT\"]\n"),
+            invalid(&[("secret_prefix", "is not a string")])
+        );
+        // Both keys are named, even without an app to check.
+        assert_eq!(
+            settings("app = \"\"\nsecret_prefix = 2\n"),
+            invalid(&[("app", "is empty"), ("secret_prefix", "is not a string")])
+        );
+        assert_eq!(
+            settings("secret_prefix = \"GITHUB_BOT\"\n"),
+            invalid(&[("secret_prefix", prefix)])
+        );
+    }
+
+    #[test]
+    fn an_invalid_app_is_a_finding_and_doctor_asks_nothing_about_it() {
+        let host = FakeHost::yes();
+        let app = NoApp::Invalid(vec![
+            ("app".into(), "is not a string".into()),
+            ("secret_prefix".into(), "is empty".into()),
+        ]);
+        let report = host.report_for(Err(&app));
+        assert_eq!(*host.asked.borrow(), ["check storm/review on main"]);
+        assert!(report.notes.is_empty());
+        assert_eq!(
+            report.findings.iter().map(|f| f.to_string()).collect::<Vec<_>>(),
+            [
+                ".github/fabrial.toml: app is not a string; doctor did not check the App or its secrets",
+                ".github/fabrial.toml: secret_prefix is empty; doctor did not check the App or its secrets",
+            ]
         );
     }
 
     #[test]
     fn without_an_app_doctor_skips_it_and_its_secrets_but_checks_the_branch() {
         let host = FakeHost { review: Answer::No, ..FakeHost::yes() };
-        let report = host.report_for(Err(".github/fabrial.toml names no app"));
+        let report = host.report_for(Err(&NoApp::Absent(".github/fabrial.toml names no app".into())));
         assert_eq!(*host.asked.borrow(), ["check storm/review on main"]);
         assert_eq!(
             report.notes.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
