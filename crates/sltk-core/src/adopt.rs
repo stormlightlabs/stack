@@ -161,7 +161,7 @@ pub fn plan(train: &Train, version: &str, adopt: &Adopt) -> Result<Adoption, Set
 pub fn apply(train: &Train, adopt: &Adopt, adoption: &Adoption, output: &mut dyn Write) -> Result<Pin, SetupError> {
     let pin_path = adopt.root.join(pin::PATH);
     if std::fs::symlink_metadata(&pin_path).is_ok() {
-        return Err(SetupError::Changed { path: pin_path });
+        return Err(SetupError::PinExists { path: pin_path });
     }
     let now = glue::plan(adopt.root, Existing::Replace)?;
     if now != adoption.glue {

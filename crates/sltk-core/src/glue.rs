@@ -152,9 +152,17 @@ pub fn apply(root: &Path, changes: &[Change]) -> Result<Vec<&'static str>, GlueE
     Ok(written)
 }
 
-/// The file the Tasks section goes in: [`AGENTS`], or [`CLAUDE`] when the
-/// repository has that and no AGENTS.md.
+/// The file the Tasks section goes in: the one of [`AGENTS`] and [`CLAUDE`]
+/// that already holds a [`TASKS_BEGIN`] line, else [`AGENTS`], or [`CLAUDE`]
+/// when the repository has that and no AGENTS.md. Checking for the marker
+/// first keeps the target where an earlier run put it, even after `fab
+/// update` creates AGENTS.md beside a CLAUDE.md that holds the section.
 pub fn tasks_file(root: &Path) -> Result<&'static str, GlueError> {
+    for relative in [AGENTS, CLAUDE] {
+        if holds_marker(root, relative)? {
+            return Ok(relative);
+        }
+    }
     if kind_or_link(&root.join(AGENTS))? {
         return Ok(AGENTS);
     }
@@ -176,8 +184,9 @@ pub fn tasks_section(existing: Option<&str>) -> Result<String, String> {
 
 /// [`tasks_section`], except that with [`Existing::Replace`] a file with no
 /// markers and one `## Tasks` heading has that section replaced in place:
-/// the heading line up to the next heading of level one or two outside a
-/// code fence, or the end of the file.
+/// the heading line up to the next line outside a code fence that is a
+/// heading of level one or two or starts an HTML comment, or the end of the
+/// file.
 pub fn tasks_section_with(existing: Option<&str>, policy: Existing) -> Result<String, String> {
     let section = format!("{TASKS_BEGIN}\n{TASKS}{TASKS_END}\n");
     let Some(text) = existing.filter(|text| !text.is_empty()) else {
@@ -305,7 +314,9 @@ fn tasks_headings(text: &str) -> Vec<usize> {
 
 /// The byte offset where the section whose heading starts at `start` ends:
 /// the next line, outside a code fence, that is a heading of level one or
-/// two, or the end of `text`.
+/// two or starts an HTML comment, or the end of `text`. A comment line ends
+/// it because another tool's marker, such as `<!-- fabrial:begin -->`, can
+/// open the block that follows, and replacing the marker would lose it.
 fn section_end(text: &str, start: usize) -> usize {
     let mut at = start;
     let mut fenced = false;
@@ -314,6 +325,9 @@ fn section_end(text: &str, start: usize) -> usize {
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             fenced = !fenced;
         } else if i > 0 && !fenced {
+            if trimmed.starts_with("<!--") {
+                return at;
+            }
             let level = trimmed.bytes().take_while(|&b| b == b'#').count();
             let rest = &trimmed[level..];
             if (level == 1 || level == 2) && (rest.is_empty() || rest.starts_with(char::is_whitespace)) {
@@ -431,6 +445,22 @@ fn mode_of(path: &Path) -> Option<u32> {
     }
 }
 
+/// Whether `relative` under `root` is a regular file with a [`TASKS_BEGIN`]
+/// line. A symlink or anything but a regular file holds none, so
+/// [`tasks_file`] falls back to its usual choice and [`read`] refuses it.
+fn holds_marker(root: &Path, relative: &str) -> Result<bool, GlueError> {
+    let path = root.join(relative);
+    match std::fs::symlink_metadata(&path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(GlueError::Io { path, source }),
+        Ok(meta) if !meta.is_file() => Ok(false),
+        Ok(_) => {
+            let bytes = std::fs::read(&path).map_err(|source| GlueError::Io { path, source })?;
+            Ok(!marker_lines(&String::from_utf8_lossy(&bytes), TASKS_BEGIN).is_empty())
+        }
+    }
+}
+
 /// Whether anything, a symlink included, is at `path`.
 fn kind_or_link(path: &Path) -> Result<bool, GlueError> {
     match std::fs::symlink_metadata(path) {
@@ -533,6 +563,22 @@ mod tests {
         assert_eq!(replace(&got), got);
         // Fresh setup still refuses the same file.
         assert!(tasks_section(Some(&format!("# A\n\n{old}"))).is_err());
+    }
+
+    #[test]
+    fn adoption_stops_the_unmarked_section_at_an_html_comment() {
+        let replace = |text: &str| tasks_section_with(Some(text), Existing::Replace).unwrap();
+        // Shaped like stack's own AGENTS.md: fab's block follows Tasks with
+        // its begin marker before its first heading.
+        let fab = "<!-- fabrial:begin -->\n## Branches and pull requests\n\nfab's\n<!-- fabrial:end -->\n";
+        let text = format!("# AGENTS.md\n\n## Tasks\n\nold\n\n{fab}");
+        let got = replace(&text);
+        assert_eq!(got, format!("# AGENTS.md\n\n{}\n{fab}", section()));
+        assert_eq!(got.matches("<!-- fabrial:begin -->").count(), 1);
+        assert_eq!(replace(&got), got);
+        // Any comment line ends it, indented or not, but not one in a fence.
+        let text = "## Tasks\n\n```md\n<!-- in a fence -->\n```\n  <!-- note -->\nkept\n";
+        assert_eq!(replace(text), format!("{}\n  <!-- note -->\nkept\n", section()));
     }
 
     #[test]

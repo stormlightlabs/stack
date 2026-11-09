@@ -355,6 +355,48 @@ fn a_claude_md_without_agents_md_gets_the_tasks_section() {
 }
 
 #[test]
+fn a_rerun_keeps_the_tasks_section_in_claude_md_after_fab_update_writes_agents_md() {
+    // fab update creates AGENTS.md, then the skill install fails.
+    let fakes = Fakes::new(4, 0);
+    std::fs::rename(fakes.root.join(glue::AGENTS), fakes.root.join(glue::CLAUDE)).unwrap();
+    let agents = format!("# AGENTS.md\n\n{AFTER}");
+    write_script(
+        &fakes.bin.join("fab"),
+        &format!("#!/bin/sh\nprintf '%s' '{agents}' > AGENTS.md\n"),
+    );
+    write_script(
+        &fakes.bin.join("arcl"),
+        "#!/bin/sh\n[ \"$1 $2 $3\" = 'skill install --check' ] && exit 4\nexit 5\n",
+    );
+    assert!(fakes.adopt().0.is_err());
+    let claude = fakes.read(glue::CLAUDE);
+    assert_eq!(fakes.read(glue::AGENTS), agents);
+
+    // The rerun finds the markers in CLAUDE.md and leaves AGENTS.md alone.
+    write_script(
+        &fakes.bin.join("arcl"),
+        "#!/bin/sh\n[ \"$1 $2 $3\" = 'skill install --check' ] && exit 4\nexit 0\n",
+    );
+    assert_eq!(glue::tasks_file(&fakes.root).unwrap(), glue::CLAUDE);
+    let adoption = fakes.plan().unwrap();
+    assert!(adoption.glue.is_empty(), "{:?}", adoption.glue);
+    fakes.adopt().0.unwrap();
+    assert_eq!(fakes.read(glue::CLAUDE), claude);
+    assert_eq!(fakes.read(glue::AGENTS), agents);
+}
+
+#[test]
+fn a_pin_written_after_the_diff_is_refused_as_existing() {
+    let fakes = Fakes::new(0, 0);
+    fakes.with(&[], |adopt| {
+        let adoption = adopt::plan(&train(), "1.2.3", adopt).unwrap();
+        std::fs::write(fakes.root.join(pin::PATH), "").unwrap();
+        let err = adopt::apply(&train(), adopt, &adoption, &mut Vec::new()).unwrap_err();
+        assert!(matches!(err, SetupError::PinExists { .. }), "{err:?}");
+    });
+}
+
+#[test]
 fn a_failed_fab_update_leaves_no_pin_and_a_rerun_finishes() {
     let fakes = Fakes::new(0, 3);
     let (result, _) = fakes.adopt();

@@ -125,15 +125,19 @@ enum Command {
     /// commands it will run and a diff of each file it writes: the session
     /// hook, which replaces any other, the Tasks section, which replaces a
     /// ## Tasks section outside the markers in place, the settings entry and
-    /// the pin. The Tasks section goes in AGENTS.md, or in CLAUDE.md when
-    /// the repository has that and no AGENTS.md. Without --yes it asks
+    /// the pin. The Tasks section goes in whichever of AGENTS.md and
+    /// CLAUDE.md holds the sltk:tasks markers, else in AGENTS.md, or in
+    /// CLAUDE.md when the repository has that and no AGENTS.md. A ## Tasks
+    /// section outside the markers ends at the next # or ## heading or
+    /// HTML comment line. Without --yes it asks
     /// before changing anything, and exits 3 without writing when the
     /// answer is no, or off a terminal. With a yes it writes those files,
     /// runs `fab update`, `arcl init --workspace` when there is no .arcl,
     /// and `arcl skill install` when the check exited 4, then writes the
     /// pin. A failure leaves no pin, and a rerun adopts again.
     ///
-    /// Exits 0 when set up, 1 otherwise.
+    /// Exits 0 when set up, 3 when adoption is declined or not confirmed,
+    /// and 1 on any other failure.
     Init {
         /// GitHub login of the person who approves pull requests.
         #[arg(long)]
