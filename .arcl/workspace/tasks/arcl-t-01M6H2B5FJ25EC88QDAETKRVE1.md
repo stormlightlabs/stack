@@ -2,10 +2,11 @@
 id = "arcl-t-01M6H2B5FJ25EC88QDAETKRVE1"
 parent = "arcl-t-01M6H2B5DNJQDEJ0AVAKFJW534"
 title = "Check the repository through a Host trait"
-status = "in_progress"
+status = "completed"
 priority = "normal"
 position = 1
 blocked-by = ["arcl-t-01M6H2B5F0JFR4Q755DJJY9228"]
+evidence = "Done in #16 at 1ec3922: sltk doctor checks the App, its secrets and storm/review on main through a Host trait whose GitHub implementation uses gh"
 +++
 
 The spec keeps the git host behind one
