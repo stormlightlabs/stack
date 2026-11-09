@@ -436,16 +436,16 @@ sha256 = "{HASH}"
     #[test]
     fn an_unknown_tool_is_named() {
         let train = fixture_train();
-        let err = pin(&["nimbus"]).render(&train).unwrap_err();
+        let err = pin(&["gizmo"]).render(&train).unwrap_err();
         assert!(
-            matches!(&err, PinError::UnknownTool { tool } if tool == "nimbus"),
+            matches!(&err, PinError::UnknownTool { tool } if tool == "gizmo"),
             "{err:?}"
         );
-        assert_eq!(err.to_string(), ".github/sltk.toml: the train has no tool named nimbus");
+        assert_eq!(err.to_string(), ".github/sltk.toml: the train has no tool named gizmo");
 
-        let text = format!("version = \"0.1.0\"\n{}optional = [\"nimbus\"]\n", hash_lines());
+        let text = format!("version = \"0.1.0\"\n{}optional = [\"gizmo\"]\n", hash_lines());
         let err = Pin::parse(&text, &train).unwrap_err();
-        assert_eq!(err.to_string(), ".github/sltk.toml: the train has no tool named nimbus");
+        assert_eq!(err.to_string(), ".github/sltk.toml: the train has no tool named gizmo");
     }
 
     #[test]
