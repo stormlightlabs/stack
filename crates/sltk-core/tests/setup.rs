@@ -9,6 +9,7 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use sltk_core::glue;
 use sltk_core::pin::{self, Pin};
 use sltk_core::setup::{FAB_SETTINGS, FabSettings, HashSource, Init, SetupError, init};
 use sltk_core::train::{Platform, Train};
@@ -199,6 +200,9 @@ fn init_runs_fab_then_arcl_in_the_root_and_writes_the_pin() {
         "running fab init --owner octo --trailer 'Ada Lovelace <ada@example.com>' --gates 'just check'\n\
          running arcl init --workspace\n\
          running arcl skill install\n\
+         wrote AGENTS.md\n\
+         wrote .claude/hooks/session-start.sh\n\
+         wrote .claude/settings.json\n\
          wrote .github/sltk.toml\n"
     );
     let text = std::fs::read_to_string(fakes.root.join(pin::PATH)).unwrap();
@@ -285,6 +289,9 @@ fn a_rerun_after_a_failure_skips_fab_init_and_finishes() {
         "skipping fab init: .github/fabrial.toml already holds these settings\n\
          running arcl init --workspace\n\
          running arcl skill install\n\
+         wrote AGENTS.md\n\
+         wrote .claude/hooks/session-start.sh\n\
+         wrote .claude/settings.json\n\
          wrote .github/sltk.toml\n"
     );
     assert_eq!(
@@ -479,4 +486,154 @@ fn a_with_name_the_train_lacks_stops_init_before_any_command() {
         "sltk: .github/sltk.toml: the train has no tool named nope"
     );
     assert!(fakes.calls().is_empty());
+}
+
+/// The bytes of each file `init` writes, by path relative to the root.
+fn written(root: &Path) -> Vec<(&'static str, Vec<u8>, u32)> {
+    [glue::AGENTS, glue::HOOK, glue::SETTINGS, pin::PATH]
+        .into_iter()
+        .map(|path| {
+            let full = root.join(path);
+            let mode = std::fs::metadata(&full).unwrap().permissions().mode() & 0o777;
+            (path, std::fs::read(&full).unwrap(), mode)
+        })
+        .collect()
+}
+
+#[test]
+fn init_writes_the_tasks_section_and_the_hook_and_a_second_run_changes_nothing() {
+    let fakes = Fakes::new(Skill::Works);
+    let agents = fakes.root.join(glue::AGENTS);
+    std::fs::write(&agents, "# AGENTS.md\n\nKeep this.\n").unwrap();
+    std::fs::create_dir_all(fakes.root.join(".claude")).unwrap();
+    std::fs::write(
+        fakes.root.join(glue::SETTINGS),
+        "{\n  \"permissions\": {\n    \"allow\": [\"Bash(ls)\"]\n  }\n}\n",
+    )
+    .unwrap();
+    fakes.init(&[], &Fixed).0.unwrap();
+
+    let text = std::fs::read_to_string(&agents).unwrap();
+    assert_eq!(
+        text,
+        format!(
+            "# AGENTS.md\n\nKeep this.\n\n{}\n{}{}\n",
+            glue::TASKS_BEGIN,
+            glue::TASKS,
+            glue::TASKS_END
+        )
+    );
+    let hook = fakes.root.join(glue::HOOK);
+    assert_eq!(std::fs::read_to_string(&hook).unwrap(), glue::HOOK_SCRIPT);
+    assert_eq!(std::fs::metadata(&hook).unwrap().permissions().mode() & 0o777, 0o755);
+    let settings = std::fs::read_to_string(fakes.root.join(glue::SETTINGS)).unwrap();
+    assert!(settings.starts_with("{\n  \"permissions\": {"), "{settings}");
+    assert!(
+        settings.contains(&format!(
+            "\"command\": {}",
+            serde_json::to_string(glue::HOOK_COMMAND).unwrap()
+        )),
+        "{settings}"
+    );
+
+    let before = written(&fakes.root);
+    let (result, output) = fakes.init(&[], &Fixed);
+    assert!(matches!(result, Err(SetupError::PinExists { .. })));
+    assert_eq!(output, "");
+    assert_eq!(written(&fakes.root), before);
+    assert_eq!(glue::write(&fakes.root).unwrap(), Vec::<&str>::new());
+    assert_eq!(written(&fakes.root), before);
+}
+
+#[test]
+fn the_glue_writers_restore_the_hook_and_keep_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(
+        glue::write(dir.path()).unwrap(),
+        [glue::AGENTS, glue::HOOK, glue::SETTINGS]
+    );
+    let hook = dir.path().join(glue::HOOK);
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(glue::write(dir.path()).unwrap(), [glue::HOOK]);
+    assert_eq!(std::fs::metadata(&hook).unwrap().permissions().mode() & 0o777, 0o755);
+    assert_eq!(glue::write(dir.path()).unwrap(), Vec::<&str>::new());
+
+    // A hook checked out under umask 002 keeps its group write bit.
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o775)).unwrap();
+    assert_eq!(glue::write(dir.path()).unwrap(), Vec::<&str>::new());
+    assert_eq!(std::fs::metadata(&hook).unwrap().permissions().mode() & 0o777, 0o775);
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o754)).unwrap();
+    assert_eq!(glue::write(dir.path()).unwrap(), [glue::HOOK]);
+}
+
+#[test]
+fn a_linked_agents_file_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink("elsewhere.md", dir.path().join(glue::AGENTS)).unwrap();
+    let err = glue::write(dir.path()).unwrap_err().to_string();
+    assert!(
+        err.ends_with("AGENTS.md is a symlink, which sltk does not follow"),
+        "{err}"
+    );
+    assert!(!dir.path().join(".claude").exists());
+}
+
+#[test]
+fn a_hook_sltk_did_not_write_is_refused_and_nothing_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let hook = dir.path().join(glue::HOOK);
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook, "#!/bin/sh\necho mine\n").unwrap();
+    let err = glue::write(dir.path()).unwrap_err().to_string();
+    assert_eq!(
+        err,
+        format!(
+            "sltk: {}: differs from the hook sltk writes, and sltk does not replace it. Adopting an \
+             existing hook comes in a later release; until then, move this one aside and rerun sltk init",
+            hook.display()
+        )
+    );
+    assert_eq!(std::fs::read_to_string(&hook).unwrap(), "#!/bin/sh\necho mine\n");
+    assert!(!dir.path().join(glue::AGENTS).exists());
+    assert!(!dir.path().join(glue::SETTINGS).exists());
+}
+
+#[test]
+fn an_unmarked_tasks_section_is_refused_and_nothing_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let agents = dir.path().join(glue::AGENTS);
+    std::fs::write(&agents, "# AGENTS.md\n\n## Tasks\n\nOur rules.\n").unwrap();
+    let err = glue::write(dir.path()).unwrap_err().to_string();
+    assert!(err.contains("AGENTS.md: has a ## Tasks heading outside"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(&agents).unwrap(),
+        "# AGENTS.md\n\n## Tasks\n\nOur rules.\n"
+    );
+    assert!(!dir.path().join(".claude").exists());
+}
+
+#[test]
+fn a_linked_directory_above_a_glue_file_is_refused() {
+    for linked in [".claude", ".claude/hooks"] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = repo.join(linked);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let err = glue::write(&repo).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!("sltk: {} is a symlink, which sltk does not follow", link.display()),
+            "{linked}"
+        );
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "{linked}");
+        assert!(!repo.join(glue::AGENTS).exists(), "{linked}");
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".claude"), "").unwrap();
+    let err = glue::write(dir.path()).unwrap_err().to_string();
+    assert!(err.ends_with(".claude is not a directory"), "{err}");
 }

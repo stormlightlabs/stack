@@ -91,7 +91,8 @@ enum Command {
     /// Exits 0 when nothing is wrong, 1 when something is, and 2 when it
     /// could not check the tools, as when the pin cannot be read or parsed.
     Doctor,
-    /// Set up this repository: run fab's and arcl's setup, then write the pin.
+    /// Set up this repository: run fab's and arcl's setup, write the session
+    /// hook and the Tasks section, then write the pin.
     ///
     /// Runs `fab init` with --owner, --trailer and --gates, then
     /// `arcl init --workspace` and `arcl skill install`, in the repository
@@ -100,16 +101,22 @@ enum Command {
     /// out; off a terminal a missing one is an error. It stops at the first
     /// command that fails and names the commands that ran and the ones that
     /// did not; rerunning with the same flags finishes the setup. When every
-    /// command succeeds it writes .github/sltk.toml, pinning this sltk
-    /// release and the sha256 of its archives, read from the release's
-    /// .sha256 files. It reads those first, so it changes nothing when this
-    /// sltk has no published release. Before the first command it records
-    /// the flags and the train's fab version in sltk-init in the git
-    /// directory, and removes that record after writing the pin. It refuses
-    /// a repository that already has .github/sltk.toml, or any
-    /// .github/fabrial.toml but one an earlier run left: the record matches
-    /// the flags, and the file holds the same settings and the train's fab
-    /// version. Then it skips `fab init`. Exits 0 when set up, 1 otherwise.
+    /// command succeeds it writes the Tasks section into AGENTS.md between
+    /// the sltk:tasks markers, .claude/hooks/session-start.sh, and the
+    /// hook's SessionStart entry in .claude/settings.json, keeping the
+    /// file's other keys and hooks. It refuses, before writing any of them,
+    /// a hook it did not write, a ## Tasks heading outside the markers, and
+    /// a symlink in any of their paths. Then it writes .github/sltk.toml,
+    /// pinning this sltk release and the sha256 of its archives, read from
+    /// the release's .sha256 files. It reads those first, so it changes
+    /// nothing when this sltk has no published release. Before the first
+    /// command it records the flags and the train's fab version in
+    /// sltk-init in the git directory, and removes that record after
+    /// writing the pin. It refuses a repository that already has
+    /// .github/sltk.toml, or any .github/fabrial.toml but one an earlier run
+    /// left: the record matches the flags, and the file holds the same
+    /// settings and the train's fab version. Then it skips `fab init`.
+    /// Exits 0 when set up, 1 otherwise.
     Init {
         /// GitHub login of the person who approves pull requests.
         #[arg(long)]
