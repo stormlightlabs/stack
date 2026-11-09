@@ -23,7 +23,8 @@ fn fake_essentials(bin: &Path) {
     }
 }
 
-/// Runs `sltk doctor` in `cwd` with `cargo_home` and a PATH of `path`.
+/// Runs `sltk doctor` in `cwd` with `cargo_home` and a PATH of `path`. That
+/// PATH holds no gh, so doctor skips the repository checks, which exit 0.
 fn doctor(cwd: &Path, cargo_home: &Path, path: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_sltk"))
         .arg("doctor")
@@ -56,7 +57,10 @@ fn a_machine_on_the_train_exits_0() {
     assert_eq!(output.status.code(), Some(0), "{stdout}");
     assert_eq!(
         stdout,
-        format!("sltk doctor: checked fab, arcl in {}: no problems\n", bin.display())
+        format!(
+            "skipped repository checks: gh not found\nsltk doctor: checked fab, arcl in {}: no problems\n",
+            bin.display()
+        )
     );
 }
 
@@ -72,7 +76,7 @@ fn a_missing_tool_exits_1() {
     assert_eq!(
         stdout,
         format!(
-            "arcl: {} is not installed\nsltk doctor: checked fab, arcl in {}: 1 problem\n",
+            "arcl: {} is not installed\nskipped repository checks: gh not found\nsltk doctor: checked fab, arcl in {}: 1 problem\n",
             bin.join("arcl").display(),
             bin.display()
         )
@@ -113,6 +117,7 @@ fn a_pin_of_another_release_is_a_finding_and_exits_1() {
         stdout,
         format!(
             ".github/sltk.toml: pins sltk 9.9.9, but this is sltk {running}; doctor checks the tools sltk {running} pins\n\
+             skipped repository checks: gh not found\n\
              sltk doctor: checked fab, arcl in {}: 1 problem\n",
             bin.display()
         )

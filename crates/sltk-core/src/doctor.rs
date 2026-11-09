@@ -2,19 +2,37 @@
 //! tool's binary in the bin directory and on `PATH`, runs `<binary> --version`,
 //! and reports what differs from the train. It changes nothing.
 //!
-//! Every input comes in through [`Machine`], so tests build a `PATH`, a bin
-//! directory and Homebrew prefixes of their own.
+//! Inside a git repository it also asks the repository's [`Host`] whether
+//! stormlight-thunderbot is installed, its secrets are available and
+//! `storm/review` is required on `main`.
+//!
+//! Every input comes in through [`Machine`] and [`Host`], so tests build a
+//! `PATH`, a bin directory, Homebrew prefixes and a host of their own.
 
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+use crate::host::{Answer, Host};
 use crate::pin::{self, Pin, PinError};
 use crate::train::{Tier, Tool, Train};
+
+/// The App whose installation doctor checks: it opens pull requests, posts
+/// review comments and sets `storm/review`.
+pub const APP: &str = "stormlight-thunderbot";
+
+/// The secrets fabrial's workflows read to act as [`APP`].
+pub const SECRETS: [&str; 2] = ["THUNDERBOT_APP_ID", "THUNDERBOT_PRIVATE_KEY"];
+
+/// The check that must be required before a pull request merges.
+pub const REVIEW_CHECK: &str = "storm/review";
+
+/// The branch that must require [`REVIEW_CHECK`].
+pub const BRANCH: &str = "main";
 
 /// How long `<binary> --version` may run before doctor stops it.
 pub const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -101,6 +119,23 @@ pub enum Finding {
         /// Why, as ".github/sltk.toml is a symlink".
         reason: String,
     },
+    /// The host says the App is not installed.
+    AppMissing {
+        /// The App's slug.
+        app: String,
+    },
+    /// The host says the repository's workflows cannot read a secret.
+    SecretMissing {
+        /// The secret's name.
+        name: String,
+    },
+    /// The host says a branch does not require a check.
+    CheckNotRequired {
+        /// The check.
+        check: String,
+        /// The branch.
+        branch: String,
+    },
 }
 
 impl fmt::Display for Finding {
@@ -129,6 +164,36 @@ impl fmt::Display for Finding {
                 pin::PATH
             ),
             Finding::PinRefused { reason } => write!(f, "{reason}; doctor read no pin"),
+            Finding::AppMissing { app } => write!(f, "{app} is not installed"),
+            Finding::SecretMissing { name } => write!(f, "secret {name} is not available to this repository"),
+            Finding::CheckNotRequired { check, branch } => write!(f, "{check} is not required on {branch}"),
+        }
+    }
+}
+
+/// A repository check doctor did not finish. Neither kind is a problem on its
+/// own: the setting may well be right.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Note {
+    /// Doctor ran no repository checks.
+    Skipped {
+        /// Why, as "gh not found".
+        reason: String,
+    },
+    /// The host could not answer one check.
+    CouldNotCheck {
+        /// What was asked, as "secret THUNDERBOT_APP_ID".
+        what: String,
+        /// The host's reason.
+        reason: String,
+    },
+}
+
+impl fmt::Display for Note {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Note::Skipped { reason } => write!(f, "skipped repository checks: {reason}"),
+            Note::CouldNotCheck { what, reason } => write!(f, "could not check {what}: {reason}"),
         }
     }
 }
@@ -157,6 +222,17 @@ enum PinText {
     Read(String),
     /// Why doctor would not read it.
     Refused(String),
+}
+
+/// What a process wrote and how it exited, from [`run_capped`].
+#[derive(Debug, Clone)]
+pub struct Captured {
+    /// How it exited.
+    pub status: ExitStatus,
+    /// Its stdout, cut at the cap.
+    pub stdout: String,
+    /// Its stderr, cut at the cap.
+    pub stderr: String,
 }
 
 /// What doctor reads from the machine.
@@ -194,6 +270,51 @@ pub struct Report {
     pub checked: Vec<String>,
     /// What is wrong, in the order found.
     pub findings: Vec<Finding>,
+    /// The repository checked, as [`Host::repository`] names it.
+    pub repository: Option<String>,
+    /// Repository checks doctor skipped or could not finish.
+    pub notes: Vec<Note>,
+}
+
+/// A pipe a reading thread fills, from [`Reader::start`].
+struct Reader {
+    /// What the thread has read so far.
+    read: Arc<Mutex<Vec<u8>>>,
+    /// Gets the thread's result once it stops.
+    done: mpsc::Receiver<io::Result<()>>,
+    /// The result, once received.
+    result: Option<io::Result<()>>,
+}
+
+impl Reader {
+    /// Starts a thread reading `from` up to `max` bytes.
+    fn start(from: impl Read + Send + 'static, max: u64) -> Reader {
+        let read = Arc::new(Mutex::new(Vec::new()));
+        let (send, done) = mpsc::channel();
+        let shared = Arc::clone(&read);
+        std::thread::spawn(move || {
+            let _ = send.send(read_capped(from, &shared, max));
+        });
+        Reader { read, done, result: None }
+    }
+
+    /// Waits for the thread until `deadline`, and says whether it stopped.
+    fn wait_until(&mut self, deadline: Instant) -> bool {
+        if self.result.is_none() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            self.result = self.done.recv_timeout(left).ok();
+        }
+        self.result.is_some()
+    }
+
+    /// What was read, with invalid UTF-8 replaced, or the read error.
+    fn text(self) -> Result<String, String> {
+        if let Some(Err(err)) = self.result {
+            return Err(format!("could not read its output: {err}"));
+        }
+        let bytes = self.read.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
 }
 
 /// Checks the tools `train` lists on `machine`.
@@ -204,7 +325,7 @@ pub struct Report {
 /// repository as unpinned: an optional tool is checked only when the bin
 /// directory has it.
 pub fn check(train: &Train, pin: Option<&RepoPin>, running: &str, machine: &Machine) -> Report {
-    let mut report = Report { checked: Vec::new(), findings: Vec::new() };
+    let mut report = Report { checked: Vec::new(), findings: Vec::new(), repository: None, notes: Vec::new() };
     let pin = match pin {
         Some(RepoPin::Current(pin)) => Some(pin),
         Some(RepoPin::Other { version }) => {
@@ -230,14 +351,49 @@ pub fn check(train: &Train, pin: Option<&RepoPin>, running: &str, machine: &Mach
     report
 }
 
+/// Asks `host` whether [`APP`] is installed, each of [`SECRETS`] is available
+/// and [`BRANCH`] requires [`REVIEW_CHECK`]. A no is a finding; an answer the
+/// host could not give is a [`Note::CouldNotCheck`].
+pub fn check_repository(host: &dyn Host, report: &mut Report) {
+    report.repository = Some(host.repository());
+    let mut record = |answer: Answer, finding: Finding, what: String| match answer {
+        Answer::Yes => {}
+        Answer::No => report.findings.push(finding),
+        Answer::Unknown(reason) => report.notes.push(Note::CouldNotCheck { what, reason }),
+    };
+    record(
+        host.app_installed(APP),
+        Finding::AppMissing { app: APP.to_owned() },
+        format!("whether {APP} is installed"),
+    );
+    for name in SECRETS {
+        record(
+            host.secret_available(name),
+            Finding::SecretMissing { name: name.to_owned() },
+            format!("secret {name}"),
+        );
+    }
+    record(
+        host.check_required(BRANCH, REVIEW_CHECK),
+        Finding::CheckNotRequired { check: REVIEW_CHECK.to_owned(), branch: BRANCH.to_owned() },
+        format!("whether {REVIEW_CHECK} is required on {BRANCH}"),
+    );
+}
+
+/// The root of the git repository `start` is in: the nearest directory at or
+/// above it holding a `.git` entry, a directory in a clone and a file in a
+/// worktree. Outside a repository there is none.
+pub fn find_repo_root(start: &Path) -> Option<&Path> {
+    start.ancestors().find(|dir| exists(&dir.join(".git")))
+}
+
 /// The nearest directory at or above `start` that has a `.github/sltk.toml`,
-/// searching no higher than the root of the git repository `start` is in.
-/// That root is the nearest directory holding a `.git` entry, a directory in
-/// a clone and a file in a worktree, so a repository never takes the pin of
-/// one it sits inside. Outside a repository there is no pin. The pin is found
-/// without following a symlink at its own path; [`read_pin`] refuses one.
+/// searching no higher than [`find_repo_root`], so a repository never takes
+/// the pin of one it sits inside. Outside a repository there is no pin. The
+/// pin is found without following a symlink at its own path; [`read_pin`]
+/// refuses one.
 pub fn find_pin_root(start: &Path) -> Option<PathBuf> {
-    let repo = start.ancestors().find(|dir| exists(&dir.join(".git")))?;
+    let repo = find_repo_root(start)?;
     start
         .ancestors()
         .take(start.ancestors().position(|dir| dir == repo)? + 1)
@@ -443,50 +599,58 @@ fn open_no_follow(path: &Path) -> io::Result<std::fs::File> {
 }
 
 /// Runs `<binary> --version` and returns what it wrote to stdout, up to
-/// [`MAX_VERSION_OUTPUT`] bytes.
-///
-/// The binary runs in a process group of its own. Once it exits, doctor reads
-/// for up to [`EXIT_GRACE`] more and uses what it has, since a background
-/// process the binary started may hold stdout open. If it has not exited
-/// after `timeout`, that is the error. Either way doctor then kills the whole
-/// group. A process that left the group, as with `setsid`, can still hold
-/// the pipe; the reading thread then waits on it until sltk exits.
+/// [`MAX_VERSION_OUTPUT`] bytes, as [`run_capped`] runs it.
 fn run_version(binary: &Path, timeout: Duration) -> Result<String, String> {
-    let mut child = spawn_version(binary).map_err(|err| format!("could not run it: {err}"))?;
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let read = Arc::new(Mutex::new(Vec::new()));
-    let (send, done) = mpsc::channel();
-    let shared = Arc::clone(&read);
-    std::thread::spawn(move || {
-        let _ = send.send(read_capped(stdout, &shared));
-    });
+    let mut command = Command::new(binary);
+    command.arg("--version");
+    run_capped(&mut command, timeout, MAX_VERSION_OUTPUT).map(|output| output.stdout)
+}
+
+/// Runs `command` with stdin closed and returns how it exited and what it
+/// wrote, up to `max` bytes from each of stdout and stderr.
+///
+/// The process runs in a process group of its own. Once it exits, doctor
+/// reads for up to [`EXIT_GRACE`] more and uses what it has, since a
+/// background process it started may hold a pipe open. If it has not exited
+/// after `timeout`, that is the error. Either way doctor then kills the whole
+/// group. A process that left the group, as with `setsid`, can still hold a
+/// pipe; its reading thread then waits on it until sltk exits.
+pub fn run_capped(command: &mut Command, timeout: Duration, max: u64) -> Result<Captured, String> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(command, 0);
+    let mut child = spawn_retrying(command).map_err(|err| format!("could not run it: {err}"))?;
+    let mut stdout = Reader::start(child.stdout.take().expect("stdout is piped"), max);
+    let mut stderr = Reader::start(child.stderr.take().expect("stderr is piped"), max);
     let exited = wait_for_exit(&mut child, Instant::now() + timeout);
-    let mut result = done.recv_timeout(if exited { EXIT_GRACE } else { Duration::ZERO });
+    let grace = Instant::now() + if exited { EXIT_GRACE } else { Duration::ZERO };
+    let finished = stdout.wait_until(grace) & stderr.wait_until(grace);
     kill_group(&mut child);
-    let _ = child.wait();
+    let status = child.wait();
     if !exited {
         return Err(format!("it did not exit within {} s", timeout.as_secs_f32()));
     }
-    if result.is_err() {
-        // The kill closes the pipe for every process in the group, so the
-        // thread may now finish what is buffered.
-        result = done.recv_timeout(EXIT_GRACE);
+    if !finished {
+        // The kill closes the pipes for every process in the group, so the
+        // threads may now finish what is buffered.
+        let grace = Instant::now() + EXIT_GRACE;
+        stdout.wait_until(grace);
+        stderr.wait_until(grace);
     }
-    if let Ok(Err(err)) = result {
-        return Err(format!("could not read its output: {err}"));
-    }
-    let bytes = read.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    let status = status.map_err(|err| format!("could not wait for it: {err}"))?;
+    Ok(Captured { status, stdout: stdout.text()?, stderr: stderr.text()? })
 }
 
-/// Reads `from` into `into` until end of file or [`MAX_VERSION_OUTPUT`]
-/// bytes, appending as it goes so a caller that stops waiting still has what
-/// was read.
-fn read_capped(mut from: impl Read, into: &Mutex<Vec<u8>>) -> io::Result<()> {
+/// Reads `from` into `into` until end of file or `max` bytes, appending as
+/// it goes so a caller that stops waiting still has what was read.
+fn read_capped(mut from: impl Read, into: &Mutex<Vec<u8>>, max: u64) -> io::Result<()> {
     let mut buf = [0; 512];
     let mut total = 0;
-    while total < MAX_VERSION_OUTPUT {
-        let want = buf.len().min((MAX_VERSION_OUTPUT - total) as usize);
+    while total < max {
+        let want = buf.len().min((max - total) as usize);
         let n = match from.read(&mut buf[..want]) {
             Ok(0) => return Ok(()),
             Ok(n) => n,
@@ -533,21 +697,12 @@ fn kill_group(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
-/// Starts `<binary> --version` with stdout piped, in a process group of its
-/// own on Unix, retrying while the OS reports the file busy.
-fn spawn_version(binary: &Path) -> io::Result<std::process::Child> {
+/// Starts `command`, retrying while the OS reports the file busy, as when an
+/// install is still writing it.
+fn spawn_retrying(command: &mut Command) -> io::Result<std::process::Child> {
     let mut attempt = 1;
     loop {
-        let mut command = Command::new(binary);
-        command
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        #[cfg(unix)]
-        std::os::unix::process::CommandExt::process_group(&mut command, 0);
-        let result = command.spawn();
-        match result {
+        match command.spawn() {
             Err(err) if err.kind() == io::ErrorKind::ExecutableFileBusy && attempt < BUSY_ATTEMPTS => {
                 attempt += 1;
                 std::thread::sleep(Duration::from_millis(50));
@@ -564,7 +719,10 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use super::{Finding, Machine, RepoPin, Report, check, find_pin_root, parse_version, read_pin};
+    use super::{
+        Finding, Machine, Note, RepoPin, Report, check, check_repository, find_pin_root, parse_version, read_pin,
+    };
+    use crate::host::{Answer, Host};
     use crate::pin::{Pin, PinError};
     use crate::train::Train;
 
@@ -658,6 +816,60 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
 
         fn check(&self, pin: Option<&RepoPin>, path: &[&str]) -> Report {
             check(&self.train, pin, "0.2.0", &self.machine(path))
+        }
+    }
+
+    /// A host that gives set answers and records what it was asked.
+    struct FakeHost {
+        app: Answer,
+        app_id: Answer,
+        private_key: Answer,
+        review: Answer,
+        asked: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl FakeHost {
+        /// A host that answers yes to everything.
+        fn yes() -> FakeHost {
+            FakeHost {
+                app: Answer::Yes,
+                app_id: Answer::Yes,
+                private_key: Answer::Yes,
+                review: Answer::Yes,
+                asked: Default::default(),
+            }
+        }
+
+        /// What doctor finds and notes with this host.
+        fn report(&self) -> Report {
+            let mut report = Report { checked: Vec::new(), findings: Vec::new(), repository: None, notes: Vec::new() };
+            check_repository(self, &mut report);
+            report
+        }
+    }
+
+    impl Host for FakeHost {
+        fn repository(&self) -> String {
+            "owner/repo on Fake".to_owned()
+        }
+
+        fn app_installed(&self, app: &str) -> Answer {
+            self.asked.borrow_mut().push(format!("app {app}"));
+            self.app.clone()
+        }
+
+        fn secret_available(&self, name: &str) -> Answer {
+            self.asked.borrow_mut().push(format!("secret {name}"));
+            match name {
+                "THUNDERBOT_APP_ID" => self.app_id.clone(),
+                "THUNDERBOT_PRIVATE_KEY" => self.private_key.clone(),
+                _ => Answer::Unknown(format!("unexpected secret {name}")),
+            }
+        }
+
+        fn check_required(&self, branch: &str, check: &str) -> Answer {
+            self.asked.borrow_mut().push(format!("check {check} on {branch}"));
+            self.review.clone()
         }
     }
 
@@ -1083,5 +1295,92 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
         assert_eq!(find_pin_root(&worktree), None);
         write_pin(&worktree, "");
         assert_eq!(find_pin_root(&worktree).as_deref(), Some(worktree.as_path()));
+    }
+
+    #[test]
+    fn a_host_with_everything_set_up_has_no_findings() {
+        let host = FakeHost::yes();
+        let report = host.report();
+        assert_eq!(report.findings, []);
+        assert_eq!(report.notes, []);
+        assert_eq!(report.repository.as_deref(), Some("owner/repo on Fake"));
+        assert_eq!(
+            *host.asked.borrow(),
+            [
+                "app stormlight-thunderbot",
+                "secret THUNDERBOT_APP_ID",
+                "secret THUNDERBOT_PRIVATE_KEY",
+                "check storm/review on main"
+            ]
+        );
+    }
+
+    #[test]
+    fn each_no_from_the_host_is_a_finding() {
+        let no = FakeHost {
+            app: Answer::No,
+            app_id: Answer::No,
+            private_key: Answer::No,
+            review: Answer::No,
+            ..FakeHost::yes()
+        };
+        let report = no.report();
+        assert_eq!(report.notes, []);
+        assert_eq!(
+            report.findings.iter().map(|f| f.to_string()).collect::<Vec<_>>(),
+            [
+                "stormlight-thunderbot is not installed",
+                "secret THUNDERBOT_APP_ID is not available to this repository",
+                "secret THUNDERBOT_PRIVATE_KEY is not available to this repository",
+                "storm/review is not required on main",
+            ]
+        );
+        // Each answer stands alone.
+        let one = |host: FakeHost| host.report().findings;
+        assert_eq!(
+            one(FakeHost { app: Answer::No, ..FakeHost::yes() }),
+            [Finding::AppMissing { app: "stormlight-thunderbot".into() }]
+        );
+        assert_eq!(
+            one(FakeHost { app_id: Answer::No, ..FakeHost::yes() }),
+            [Finding::SecretMissing { name: "THUNDERBOT_APP_ID".into() }]
+        );
+        assert_eq!(
+            one(FakeHost { private_key: Answer::No, ..FakeHost::yes() }),
+            [Finding::SecretMissing { name: "THUNDERBOT_PRIVATE_KEY".into() }]
+        );
+        assert_eq!(
+            one(FakeHost { review: Answer::No, ..FakeHost::yes() }),
+            [Finding::CheckNotRequired { check: "storm/review".into(), branch: "main".into() }]
+        );
+    }
+
+    #[test]
+    fn an_answer_the_host_could_not_give_is_a_note_not_a_finding() {
+        let unknown = |reason: &str| Answer::Unknown(reason.to_owned());
+        let host = FakeHost {
+            app: unknown("HTTP 403"),
+            app_id: unknown("no admin access"),
+            private_key: Answer::No,
+            review: unknown("timed out"),
+            ..FakeHost::yes()
+        };
+        let report = host.report();
+        assert_eq!(
+            report.findings,
+            [Finding::SecretMissing { name: "THUNDERBOT_PRIVATE_KEY".into() }]
+        );
+        assert_eq!(
+            report.notes.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+            [
+                "could not check whether stormlight-thunderbot is installed: HTTP 403",
+                "could not check secret THUNDERBOT_APP_ID: no admin access",
+                "could not check whether storm/review is required on main: timed out",
+            ]
+        );
+        assert_eq!(
+            Note::Skipped { reason: "gh not found".into() }.to_string(),
+            "skipped repository checks: gh not found"
+        );
     }
 }

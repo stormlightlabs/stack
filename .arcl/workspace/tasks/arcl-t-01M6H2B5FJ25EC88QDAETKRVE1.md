@@ -2,7 +2,7 @@
 id = "arcl-t-01M6H2B5FJ25EC88QDAETKRVE1"
 parent = "arcl-t-01M6H2B5DNJQDEJ0AVAKFJW534"
 title = "Check the repository through a Host trait"
-status = "pending"
+status = "in_progress"
 priority = "normal"
 position = 1
 blocked-by = ["arcl-t-01M6H2B5F0JFR4Q755DJJY9228"]

@@ -3,6 +3,7 @@
 //! doctor's checks and repository setup.
 
 pub mod doctor;
+pub mod host;
 pub mod install;
 pub mod pin;
 pub mod platform;
