@@ -178,7 +178,7 @@ fn question(flag: Flag) -> &'static str {
 
 /// `dir` when given, else the top of the git repository holding the current
 /// directory.
-fn repository_root(dir: Option<&Path>) -> Result<PathBuf, String> {
+pub fn repository_root(dir: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(dir) = dir {
         if !dir.is_dir() {
             return Err(format!("sltk: --dir {} is not a directory\n", dir.display()));

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use sltk_core::check;
 use sltk_core::doctor::{self, Machine, Note, Report};
 use sltk_core::host::{self, GitHub};
 use sltk_core::install::{self, HttpFetch, InstallError};
@@ -28,6 +29,10 @@ const PARTIAL: u8 = 4;
 /// The exit code of `sltk doctor` when it could not finish its checks, as
 /// when the pin cannot be read.
 const DOCTOR_ERROR: u8 = 2;
+
+/// The exit code of `sltk check` when a check could not run or finish, so
+/// drift may be missing from what it printed.
+const CHECK_ERROR: u8 = 2;
 
 /// The question `sltk install` asks on a terminal without `--yes`.
 const QUESTION: &str = "Install these? [Y/n] ";
@@ -94,6 +99,27 @@ enum Command {
     /// Exits 0 when nothing is wrong, 1 when something is, and 2 when it
     /// could not check the tools, as when the pin cannot be read or parsed.
     Doctor,
+    /// Report where this repository has drifted from what sltk init sets up.
+    /// Changes nothing.
+    ///
+    /// Works in the repository root: --dir, or the top of the git repository
+    /// holding the current directory. It compares .github/sltk.toml with the
+    /// installed tools as sltk doctor does, and reports a missing pin or one
+    /// of another sltk release. It runs `fab check` and lists each line it
+    /// prints on drift, and `arcl skill install --check` and lists each skill
+    /// file it names. It compares the session hook, its SessionStart entry
+    /// in .claude/settings.json, the Tasks section and the [tasks] table in
+    /// .github/fabrial.toml with what sltk init writes when it adopts the
+    /// repository, and reports a file sltk init would refuse. It asks
+    /// nothing, so it runs the same off a terminal.
+    ///
+    /// Exits 0 when nothing differs, 1 when something does, and 2 when a
+    /// check could not run or finish, as when fab is not on PATH.
+    Check {
+        /// The repository root.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
     /// Set up this repository: run fab's and arcl's setup, write the session
     /// hook and the Tasks section, then write the pin.
     ///
@@ -225,6 +251,7 @@ fn main() -> ExitCode {
             )
         }
         Command::Doctor => run_doctor(&train),
+        Command::Check { dir } => run_check(&train, dir.as_deref()),
         Command::Init { owner, app, secret_prefix, trailer, gates, with, dir, yes } => {
             let flags = init::Flags { owner, app, secret_prefix, trailer, gates, with, dir, yes };
             let (mut input, mut output) = (io::stdin().lock(), io::stdout().lock());
@@ -371,6 +398,42 @@ fn doctor_report(report: &Report, machine: &Machine) -> String {
     out
 }
 
+/// Runs `sltk check` on the repository at `dir`, or the one the current
+/// directory is in. Returns the exit code, or the exit code and the error to
+/// print.
+fn run_check(train: &Train, dir: Option<&std::path::Path>) -> Result<u8, (u8, String)> {
+    let root = init::repository_root(dir).map_err(|err| (CHECK_ERROR, err))?;
+    let machine = Machine::from_env().map_err(|err| (CHECK_ERROR, format!("{err}\n")))?;
+    let report = check::check(train, sltk_core::VERSION, &root, &machine);
+    print!("{}", check_report(&report, &root));
+    Ok(if !report.errors.is_empty() {
+        CHECK_ERROR
+    } else if !report.drift.is_empty() {
+        FAILED
+    } else {
+        0
+    })
+}
+
+/// What `sltk check` prints: one line per difference, one per check that
+/// could not run or finish, then a line counting both.
+fn check_report(report: &check::Report, root: &std::path::Path) -> String {
+    let mut out: String = report.drift.iter().map(|drift| format!("{drift}\n")).collect();
+    out.extend(report.errors.iter().map(|error| format!("{error}\n")));
+    let drift = match report.drift.len() {
+        0 => "no drift".to_owned(),
+        1 => "1 difference".to_owned(),
+        n => format!("{n} differences"),
+    };
+    let errors = match report.errors.len() {
+        0 => String::new(),
+        1 => "; 1 check did not finish".to_owned(),
+        n => format!("; {n} checks did not finish"),
+    };
+    out.push_str(&format!("sltk check: checked {}: {drift}{errors}\n", root.display()));
+    out
+}
+
 /// What `sltk install` prints for a plan: the tools and archives it will
 /// install, or, as an error, the tools with no archive for the host.
 fn install_report(plan: &Plan) -> Result<String, String> {
@@ -414,8 +477,8 @@ mod tests {
     use sltk_core::doctor::{Finding, Machine, Note, Report};
 
     use super::{
-        Choices, Cli, DECLINED, DECLINED_LINE, FAILED, PARTIAL, QUESTION, doctor_report, install_exit_code,
-        install_report, optional_tools, pinned_set, run_install, should_install,
+        Choices, Cli, DECLINED, DECLINED_LINE, FAILED, PARTIAL, QUESTION, check_report, doctor_report,
+        install_exit_code, install_report, optional_tools, pinned_set, run_install, should_install,
     };
 
     /// A train like the real one with mire listed: fab and arcl essential,
@@ -759,6 +822,32 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
             doctor_report(&skipped, &machine),
             "skipped repository checks: gh not found\n\
              sltk doctor: checked fab in /h/.cargo/bin: no problems\n"
+        );
+    }
+
+    #[test]
+    fn check_prints_each_difference_and_error_then_a_summary() {
+        use sltk_core::check::{Drift, Report};
+        let root = PathBuf::from("/r");
+        assert_eq!(
+            check_report(&Report::default(), &root),
+            "sltk check: checked /r: no drift\n"
+        );
+        let mut report = Report { drift: vec![Drift::NoPin], errors: Vec::new() };
+        assert_eq!(
+            check_report(&report, &root),
+            ".github/sltk.toml: missing; sltk init writes it\nsltk check: checked /r: 1 difference\n"
+        );
+        report.drift.push(Drift::Fab("differs: a.yml".into()));
+        report
+            .errors
+            .push("could not run fab check: it did not exit within 120 s".into());
+        assert_eq!(
+            check_report(&report, &root),
+            ".github/sltk.toml: missing; sltk init writes it\n\
+             fab check: differs: a.yml\n\
+             could not run fab check: it did not exit within 120 s\n\
+             sltk check: checked /r: 2 differences; 1 check did not finish\n"
         );
     }
 }

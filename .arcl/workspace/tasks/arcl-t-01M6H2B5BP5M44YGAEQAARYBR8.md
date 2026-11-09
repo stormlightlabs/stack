@@ -2,7 +2,7 @@
 id = "arcl-t-01M6H2B5BP5M44YGAEQAARYBR8"
 parent = "arcl-t-01M6H2B5A7WXHN1S9S9W57BMV7"
 title = "Report drift with sltk check"
-status = "pending"
+status = "in_progress"
 priority = "normal"
 position = 0
 blocked-by = ["arcl-t-01M6H2B56F01QNVYY5C5K1CPPH"]
