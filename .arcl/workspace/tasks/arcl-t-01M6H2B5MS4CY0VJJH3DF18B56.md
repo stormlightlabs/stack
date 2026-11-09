@@ -14,9 +14,10 @@ repository's own tracker holds the details of its adoption.
 
 ## Done when
 
-Each private repository that uses fabrial has merged a PR made with
-`sltk init` at a released `sltk`, and `sltk check` passes on its
-`main`.
+Each private stormlightlabs repository with `.github/fabrial.toml` on
+`main` has merged a PR made with `sltk init` at a released `sltk`,
+and `sltk check` passes on its `main`. `gh repo list stormlightlabs
+--visibility private` lists the private repositories to check.
 
 ## Not in this task
 
