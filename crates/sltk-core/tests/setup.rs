@@ -1,6 +1,6 @@
 //! Runs `init` against fake `fab` and `arcl` scripts that record each call,
 //! with fixed archive hashes in place of a published release. The fake `fab`
-//! writes `.github/fabrial.toml` and refuses to run twice, as fab 0.8.0 does.
+//! writes `.github/fabrial.toml` and refuses to run twice, as fab 0.9.1 does.
 //! The repository is a real git repository, where `init` records its run.
 
 #![cfg(unix)]
@@ -88,13 +88,14 @@ impl Fakes {
             "#!/bin/sh\n{{ printf '%s' \"$(pwd -P)\"; for arg; do printf '\\t%s' \"$arg\"; done; echo; }} >> '{}'\n",
             calls.display()
         );
-        // `fab init --owner O --trailer T --gates G` writes the settings in
-        // fab's form, and exits 2 when they are already there. `mkdir` is not
+        // `fab init --owner O --app A --secret-prefix P --trailer T --gates G`
+        // writes the settings, and exits 2 when they are already there. `mkdir` is not
         // a builtin, so it is named by its path.
         let fab = format!(
             "{record}[ -e {FAB_SETTINGS} ] && exit 2\n\
              [ -d .github ] || /bin/mkdir .github\n\
-             printf 'owner = \"%s\"\\ntrailer = \"%s\"\\ngates = \"%s\"\\nversion = \"0.8.0\"\\n' \"$3\" \"$5\" \"$7\" > {FAB_SETTINGS}\n"
+             printf 'owner = \"%s\"\\napp = \"%s\"\\nsecret_prefix = \"%s\"\\ntrailer = \"%s\"\\ngates = \"%s\"\\nversion = \"0.9.1\"\\n' \
+             \"$3\" \"$5\" \"$7\" \"$9\" \"${{11}}\" > {FAB_SETTINGS}\n"
         );
         let marker = dir.path().join("skill-failed");
         let fail = match skill {
@@ -146,7 +147,8 @@ impl Fakes {
     fn write_fab_settings(&self, version: &str) {
         std::fs::create_dir_all(self.root.join(".github")).unwrap();
         let text = format!(
-            "owner = \"octo\"\ntrailer = \"Ada Lovelace <ada@example.com>\"\ngates = \"just check\"\nversion = \"{version}\"\n"
+            "owner = \"octo\"\napp = \"octo-bot\"\nsecret_prefix = \"OCTO\"\ntrailer = \"Ada Lovelace <ada@example.com>\"\n\
+             gates = \"just check\"\nversion = \"{version}\"\n"
         );
         std::fs::write(self.root.join(FAB_SETTINGS), text).unwrap();
     }
@@ -176,6 +178,8 @@ fn write_script(path: &Path, text: &str) {
 fn settings() -> FabSettings {
     FabSettings::new(
         "octo".into(),
+        "octo-bot".into(),
+        "OCTO".into(),
         "Ada Lovelace <ada@example.com>".into(),
         "just check".into(),
     )
@@ -197,12 +201,13 @@ fn init_runs_fab_then_arcl_in_the_root_and_writes_the_pin() {
     );
     assert_eq!(
         output,
-        "running fab init --owner octo --trailer 'Ada Lovelace <ada@example.com>' --gates 'just check'\n\
+        "running fab init --owner octo --app octo-bot --secret-prefix OCTO --trailer 'Ada Lovelace <ada@example.com>' --gates 'just check'\n\
          running arcl init --workspace\n\
          running arcl skill install\n\
          wrote AGENTS.md\n\
          wrote .claude/hooks/session-start.sh\n\
          wrote .claude/settings.json\n\
+         wrote .github/fabrial.toml\n\
          wrote .github/sltk.toml\n"
     );
     let text = std::fs::read_to_string(fakes.root.join(pin::PATH)).unwrap();
@@ -218,13 +223,26 @@ fn init_runs_fab_then_arcl_in_the_root_and_writes_the_pin() {
     assert!(text.ends_with("\noptional = []\n"), "{text}");
     assert_eq!(Pin::read(&fakes.root, &Train::embedded().unwrap()).unwrap(), pin);
     assert!(!fakes.record().exists());
+    let fab = std::fs::read_to_string(fakes.root.join(FAB_SETTINGS)).unwrap();
+    assert!(
+        fab.starts_with("owner = \"octo\"\napp = \"octo-bot\"\nsecret_prefix = \"OCTO\"\n"),
+        "{fab}"
+    );
+    assert!(
+        fab.ends_with(&format!("version = \"0.9.1\"\n{}", glue::FAB_TASKS)),
+        "{fab}"
+    );
 }
 
 /// The `fab init` call the fakes record for [`settings`].
-const FAB_INIT: [&str; 7] = [
+const FAB_INIT: [&str; 11] = [
     "init",
     "--owner",
     "octo",
+    "--app",
+    "octo-bot",
+    "--secret-prefix",
+    "OCTO",
     "--trailer",
     "Ada Lovelace <ada@example.com>",
     "--gates",
@@ -239,7 +257,7 @@ fn a_failing_command_names_what_ran_and_stops_before_the_pin() {
     assert_eq!(
         err,
         "sltk: arcl skill install failed with exit status: 7. \
-         Ran: fab init --owner octo --trailer 'Ada Lovelace <ada@example.com>' --gates 'just check'; \
+         Ran: fab init --owner octo --app octo-bot --secret-prefix OCTO --trailer 'Ada Lovelace <ada@example.com>' --gates 'just check'; \
          arcl init --workspace. Not run: none. \
          sltk did not write the pin; rerun sltk init with the same flags to finish"
     );
@@ -259,7 +277,7 @@ fn a_command_that_cannot_start_names_the_commands_not_run() {
     );
     assert!(
         err.ends_with(
-            ". Ran: fab init --owner octo --trailer 'Ada Lovelace <ada@example.com>' --gates 'just check'. \
+            ". Ran: fab init --owner octo --app octo-bot --secret-prefix OCTO --trailer 'Ada Lovelace <ada@example.com>' --gates 'just check'. \
              Not run: arcl skill install. \
              sltk did not write the pin; rerun sltk init with the same flags to finish"
         ),
@@ -277,7 +295,8 @@ fn a_rerun_after_a_failure_skips_fab_init_and_finishes() {
     let record = std::fs::read_to_string(fakes.record()).unwrap();
     assert!(
         record.ends_with(
-            "owner = \"octo\"\ntrailer = \"Ada Lovelace <ada@example.com>\"\ngates = \"just check\"\nfab = \"0.8.0\"\n"
+            "owner = \"octo\"\napp = \"octo-bot\"\nsecret_prefix = \"OCTO\"\n\
+             trailer = \"Ada Lovelace <ada@example.com>\"\ngates = \"just check\"\nfab = \"0.9.1\"\n"
         ),
         "{record}"
     );
@@ -292,6 +311,7 @@ fn a_rerun_after_a_failure_skips_fab_init_and_finishes() {
          wrote AGENTS.md\n\
          wrote .claude/hooks/session-start.sh\n\
          wrote .claude/settings.json\n\
+         wrote .github/fabrial.toml\n\
          wrote .github/sltk.toml\n"
     );
     assert_eq!(
@@ -311,14 +331,14 @@ fn a_rerun_after_a_failure_skips_fab_init_and_finishes() {
 #[test]
 fn matching_fab_settings_without_a_record_are_refused_before_any_download() {
     let fakes = Fakes::new(Skill::Works);
-    fakes.write_fab_settings("0.8.0");
+    fakes.write_fab_settings("0.9.1");
     let (result, output) = fakes.init(&[], &Unread);
     let err = result.unwrap_err().to_string();
     assert!(
         err.ends_with(
             "/.github/fabrial.toml was not written by an earlier sltk init; \
              to adopt the repository with the settings it has, remove sltk-init from the git directory \
-             and rerun sltk init without --owner, --trailer and --gates"
+             and rerun sltk init without --owner, --app, --secret-prefix, --trailer and --gates"
         ),
         "{err}"
     );
@@ -337,7 +357,7 @@ fn fab_settings_from_another_fab_are_refused_even_with_a_record() {
     let (result, _) = fakes.init(&[], &Unread);
     assert!(
         matches!(&result, Err(SetupError::FabInstalled { reason, .. })
-            if reason == "was written by fab 0.5.0, not by the train's fab 0.8.0"),
+            if reason == "was written by fab 0.5.0, not by the train's fab 0.9.1"),
         "{result:?}"
     );
     assert_eq!(fakes.calls().len(), 3);
@@ -404,7 +424,8 @@ fn a_program_on_no_absolute_path_entry_is_named() {
 fn fab_settings_with_other_values_are_refused_before_any_download() {
     let fakes = Fakes::new(Skill::Works);
     std::fs::create_dir_all(fakes.root.join(".github")).unwrap();
-    let theirs = "owner = \"octo\"\ntrailer = \"Bob <bob@example.com>\"\ngates = \"make\"\nversion = \"0.8.0\"\n";
+    let theirs = "owner = \"octo\"\napp = \"octo-bot\"\nsecret_prefix = \"OCTO\"\n\
+                  trailer = \"Bob <bob@example.com>\"\ngates = \"make\"\nversion = \"0.9.1\"\n";
     std::fs::write(fakes.root.join(FAB_SETTINGS), theirs).unwrap();
     let (result, output) = fakes.init(&[], &Unread);
     let err = result.unwrap_err().to_string();
@@ -413,7 +434,7 @@ fn fab_settings_with_other_values_are_refused_before_any_download() {
         err.ends_with(
             "/.github/fabrial.toml holds other values for --trailer, --gates; \
              to adopt the repository with the settings it has, remove sltk-init from the git directory \
-             and rerun sltk init without --owner, --trailer and --gates"
+             and rerun sltk init without --owner, --app, --secret-prefix, --trailer and --gates"
         ),
         "{err}"
     );
@@ -443,6 +464,8 @@ fn a_rerun_with_other_flags_is_refused() {
     assert!(matches!(result, Err(SetupError::Failed { .. })), "{result:?}");
     let other = FabSettings::new(
         "hubot".into(),
+        "octo-bot".into(),
+        "OCTO".into(),
         "Ada Lovelace <ada@example.com>".into(),
         "just check".into(),
     )
@@ -490,7 +513,7 @@ fn a_with_name_the_train_lacks_stops_init_before_any_command() {
 
 /// The bytes of each file `init` writes, by path relative to the root.
 fn written(root: &Path) -> Vec<(&'static str, Vec<u8>, u32)> {
-    [glue::AGENTS, glue::HOOK, glue::SETTINGS, pin::PATH]
+    [glue::AGENTS, glue::HOOK, glue::SETTINGS, FAB_SETTINGS, pin::PATH]
         .into_iter()
         .map(|path| {
             let full = root.join(path);

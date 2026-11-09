@@ -61,7 +61,7 @@ fn off_a_terminal_a_missing_flag_is_named_and_nothing_runs() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
-        "sltk: init needs --trailer; sltk asks for missing settings only on a terminal\n"
+        "sltk: init needs --app, --trailer; sltk asks for missing settings only on a terminal\n"
     );
     assert!(!dir.path().join("calls").exists());
     assert!(!dir.path().join("repo/.github").exists());
@@ -75,6 +75,8 @@ fn without_release_hashes_nothing_runs_and_no_pin_is_written() {
     let args = [
         "--owner",
         "octo",
+        "--app",
+        "octo-bot",
         "--trailer",
         "Ada <ada@example.com>",
         "--gates",
@@ -100,7 +102,7 @@ fn without_release_hashes_nothing_runs_and_no_pin_is_written() {
 #[test]
 fn a_repository_set_up_by_hand_is_adopted_without_flags() {
     let dir = tempfile::tempdir().unwrap();
-    let settings = "owner = \"octo\"\ntrailer = \"Ada <ada@example.com>\"\ngates = \"make\"\n";
+    let settings = "owner = \"octo\"\napp = \"octo-bot\"\ntrailer = \"Ada <ada@example.com>\"\ngates = \"make\"\n";
     let output = sltk_init_in(dir.path(), &[], |repo| {
         std::fs::create_dir_all(repo.join(".github")).unwrap();
         std::fs::write(repo.join(".github/fabrial.toml"), settings).unwrap();
@@ -114,6 +116,47 @@ fn a_repository_set_up_by_hand_is_adopted_without_flags() {
     assert!(!dir.path().join("calls").exists());
     let entries: Vec<_> = std::fs::read_dir(dir.path().join("repo/.github")).unwrap().collect();
     assert_eq!(entries.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("repo/.github/fabrial.toml")).unwrap(),
+        settings
+    );
+}
+
+/// Settings from fab 0.9.0 or earlier name no App, and fab update needs one.
+/// Off a terminal adoption then stops, naming --app, before any command or
+/// download; with --app it goes on to the release hashes.
+#[test]
+fn adopting_settings_without_an_app_needs_app() {
+    let settings = "owner = \"octo\"\ntrailer = \"Ada <ada@example.com>\"\ngates = \"make\"\nversion = \"0.8.0\"\n";
+    let prepare = |repo: &Path| {
+        std::fs::create_dir_all(repo.join(".github")).unwrap();
+        std::fs::write(repo.join(".github/fabrial.toml"), settings).unwrap();
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let output = sltk_init_in(dir.path(), &[], prepare);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "sltk: .github/fabrial.toml names no app, and fab update needs one; pass --app with the slug of the \
+         repository's GitHub App\n"
+    );
+    assert!(!dir.path().join("calls").exists());
+
+    let dir = tempfile::tempdir().unwrap();
+    let output = sltk_init_in(dir.path(), &["--app", "Not A Slug"], prepare);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.starts_with("sltk: --app "), "{stderr}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let output = sltk_init_in(dir.path(), &["--app", "octo-bot"], prepare);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.starts_with("sltk: could not read the sha256 of the sltk "),
+        "{stderr}"
+    );
+    assert!(!dir.path().join("calls").exists());
     assert_eq!(
         std::fs::read_to_string(dir.path().join("repo/.github/fabrial.toml")).unwrap(),
         settings

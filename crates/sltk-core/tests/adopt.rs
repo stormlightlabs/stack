@@ -19,9 +19,18 @@ use sltk_core::train::{Platform, Train};
 const DARWIN: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 const LINUX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-/// fab's settings as fab writes them.
+/// fab's settings as fab 0.9.1 writes them, with a list and no `[tasks]`.
 const FAB_TOML: &str = "# fabrial's settings for this repository.\n\
 owner = \"octo\"\n\
+app = \"octo-bot\"\n\
+secret_prefix = \"OCTO\"\n\
+trailer = \"Ada Lovelace <ada@example.com>\"\n\
+gates = \"just check\"\n\
+planning = [\".arcl/workspace/\"]\n\
+version = \"0.9.1\"\n";
+
+/// fab's settings as fab 0.8.0 wrote them, naming no App.
+const OLD_FAB_TOML: &str = "owner = \"octo\"\n\
 trailer = \"Ada Lovelace <ada@example.com>\"\n\
 gates = \"just check\"\n\
 version = \"0.8.0\"\n";
@@ -250,6 +259,7 @@ fn applying_replaces_the_hook_and_tasks_section_then_runs_fab_update_and_the_ski
         "wrote AGENTS.md\n\
          wrote .claude/hooks/session-start.sh\n\
          wrote .claude/settings.json\n\
+         wrote .github/fabrial.toml\n\
          running fab update\n\
          running arcl skill install\n\
          wrote .github/sltk.toml\n"
@@ -277,7 +287,7 @@ fn applying_replaces_the_hook_and_tasks_section_then_runs_fab_update_and_the_ski
     let quoted = serde_json::to_string(glue::HOOK_COMMAND).unwrap();
     assert_eq!(settings.matches(&quoted).count(), 1, "{settings}");
     assert!(!settings.contains("\"$CLAUDE_PROJECT_DIR/"), "{settings}");
-    assert_eq!(fakes.read(FAB_SETTINGS), FAB_TOML);
+    assert_eq!(fakes.read(FAB_SETTINGS), format!("{FAB_TOML}{}", glue::FAB_TASKS));
     assert_eq!(Pin::read(&fakes.root, &train()).unwrap(), pin);
     assert_eq!(pin.version, "1.2.3");
 
@@ -497,7 +507,7 @@ fn the_plan_lists_the_files_fab_check_reports_for_fab_update_to_rewrite() {
     assert!(
         text.contains(
             "  fab update\n\
-             fab update will rewrite these files, which fab check reports as drifted:\n  \
+             fab update will rewrite or remove these files, which fab check reports as drifted:\n  \
              .github/workflows/branch-pr.yml\n  .claude/agents/reviser.md\nIt writes these files:\n"
         ),
         "{text}"
@@ -506,7 +516,7 @@ fn the_plan_lists_the_files_fab_check_reports_for_fab_update_to_rewrite() {
     // No drift lists nothing, and a failure stops the plan.
     write_script(
         &fakes.bin.join("fab"),
-        "#!/bin/sh\necho 'fabrial 0.8.0 is installed with no drift.'\n",
+        "#!/bin/sh\necho 'fabrial 0.9.1 is installed with no drift.'\n",
     );
     let text = fakes.plan().unwrap().describe();
     assert!(!text.contains("fab check"), "{text}");
@@ -539,4 +549,54 @@ fn a_tasks_heading_only_in_a_code_block_leaves_the_file_whole() {
         fakes.read(glue::AGENTS),
         format!("{text}\n{}\n{}{}\n", glue::TASKS_BEGIN, glue::TASKS, glue::TASKS_END)
     );
+}
+
+#[test]
+fn settings_without_an_app_need_app_and_fab_update_gets_it() {
+    let fakes = Fakes::new(0, 0);
+    std::fs::write(fakes.root.join(FAB_SETTINGS), OLD_FAB_TOML).unwrap();
+    assert!(adopt::needs_app(&fakes.root).unwrap());
+    let before = tree(&fakes.root);
+    let err = fakes.plan().unwrap_err().to_string();
+    assert!(
+        err.ends_with(
+            "/.github/fabrial.toml names no app, and fab update needs one. Pass --app with the slug of the \
+             repository's GitHub App"
+        ),
+        "{err}"
+    );
+    assert_eq!(tree(&fakes.root), before);
+    assert!(fakes.calls().is_empty());
+
+    // The values the file lacks go to fab update; the ones it has must match.
+    let given = [
+        (Flag::App, "octo-bot".to_owned()),
+        (Flag::SecretPrefix, "OCTO".to_owned()),
+    ];
+    let adoption = fakes
+        .with(&given, |adopt| adopt::plan(&train(), "1.2.3", adopt))
+        .unwrap();
+    let lines: Vec<String> = adoption.commands.iter().map(|c| c.join(" ")).collect();
+    assert_eq!(lines, ["fab update --app octo-bot --secret-prefix OCTO"]);
+    let given = [(Flag::App, "octo-bot".to_owned())];
+    let adoption = fakes
+        .with(&given, |adopt| adopt::plan(&train(), "1.2.3", adopt))
+        .unwrap();
+    assert_eq!(
+        adoption.commands,
+        [["fab", "update", "--app", "octo-bot"].map(String::from)]
+    );
+
+    std::fs::write(fakes.root.join(FAB_SETTINGS), FAB_TOML).unwrap();
+    assert!(!adopt::needs_app(&fakes.root).unwrap());
+    let adoption = fakes
+        .with(&given, |adopt| adopt::plan(&train(), "1.2.3", adopt))
+        .unwrap();
+    assert_eq!(adoption.commands, [["fab", "update"].map(String::from)]);
+    let other = [(Flag::App, "hubot".to_owned()), (Flag::SecretPrefix, "OCTO".to_owned())];
+    let err = fakes
+        .with(&other, |adopt| adopt::plan(&train(), "1.2.3", adopt))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("holds other values for --app. "), "{err}");
 }

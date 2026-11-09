@@ -101,12 +101,19 @@ it.
   sha256 of each `sltk` archive and the optional tools it chose. The
   essentials are implied.
 - `sltk init` runs each tool's own setup: `fab init`, `arcl init --workspace`
-  and `arcl skill install`. `fab init` requires `--owner`, `--trailer` and
-  `--gates`, so on a fresh repository `sltk init` takes the same three flags,
-  asks for any left out when on a terminal, and passes them to `fab init`.
-- `sltk init` writes only the glue itself: the AGENTS.md Tasks section and
-  one session hook. Writing fab's or arcl's files directly would copy their
-  templates, and those copies are the drift this tool removes.
+  and `arcl skill install`. `fab init` requires `--owner`, `--app`,
+  `--trailer` and `--gates`, so on a fresh repository `sltk init` takes the
+  same four flags, asks for any left out when on a terminal, and passes them
+  to `fab init`. It also takes `--secret-prefix`, which defaults to
+  `FABRIAL` as in `fab init`, and passes it on.
+- `sltk init` writes only the glue itself: the AGENTS.md Tasks section, one
+  session hook, and the `[tasks]` table in `.github/fabrial.toml` that gives
+  `fab run` arcl's command for each step of a task. Writing fab's or arcl's
+  files directly would copy their templates, and those copies are the drift
+  this tool removes. The `[tasks]` table is the exception: `fab init` takes
+  no flag for it, and its values are fixed for arcl. sltk appends it only
+  when the file has no `tasks` key, in the form fab 0.9.1 renders, so `fab
+  check` finds no drift and `fab update` keeps it.
 - The session hook installs the pinned `sltk`, runs `sltk install --yes` from
   `.github/sltk.toml`, then builds the arcl cache. It replaces the hand-copied
   `session-start.sh`.
@@ -136,7 +143,9 @@ it.
   artifact attestations need `gh` in the session to verify, and dist's
   `github-attestations` setting, which is experimental.
 - `sltk init` adopts a repository that is already set up. It keeps the
-  settings in `.github/fabrial.toml` and runs `fab update`, replaces a copied
+  settings in `.github/fabrial.toml` and runs `fab update`. Settings from
+  fab 0.9.0 or earlier name no App, and `fab update` needs one, so adoption
+  then requires `--app` and passes it to `fab update`. It replaces a copied
   `session-start.sh`, and rewrites the Tasks section in place. It runs
   `arcl skill install --check`, which exits 4 when a skill file is missing or
   differs, and runs `arcl skill install` when it does. It shows the diff and
@@ -149,9 +158,13 @@ it.
 
 - `sltk doctor` reports missing tools, wrong versions and a `fab`, `arcl` or
   `mire` from Homebrew that comes before the pinned one on `PATH`.
-- When `gh` is installed it also checks the repository: stormlight-thunderbot
-  installed, `THUNDERBOT_APP_ID` and `THUNDERBOT_PRIVATE_KEY` available, and
-  `storm/review` required on `main`. Without `gh` it skips these and says so.
+- When `gh` is installed it also checks the repository: the App that `app`
+  in `.github/fabrial.toml` names is installed, the `<PREFIX>_APP_ID` and
+  `<PREFIX>_PRIVATE_KEY` secrets that `secret_prefix` names are available,
+  and `storm/review` is required on `main`. Settings with no
+  `secret_prefix` read `THUNDERBOT`, as fab does. Without `gh` it skips these
+  and says so. Without the file or its `app` it skips the App and secret
+  checks and says so.
 - It reports and changes nothing. Installing the App and sharing its secrets
   stay with the owner, who holds those credentials.
 
@@ -197,8 +210,12 @@ it.
 - `arclightning/crates/arcl-cli/src/app/skill.rs`: `arcl skill install` writes
   the skill into `.claude/skills` and `.agents/skills`; `--check` writes
   nothing and exits 4 when a file is missing or differs.
-- `fab init --help` in fab 0.8.0: `--owner`, `--trailer` and `--gates` are
-  required.
+- `fab init --help` in fab 0.9.1: `--owner`, `--app`, `--trailer` and
+  `--gates` are required; `--secret-prefix` defaults to `FABRIAL`.
+  `fab update --help`: an install without `app` needs `--app`, and one
+  without `secret_prefix` keeps `THUNDERBOT`.
+- `crates/fab-core/src/settings.rs` in fab 0.9.1: the `[tasks]` table and
+  how `Settings::render` writes it.
 - The GitHub releases API for fab's v0.8.0 and arcl's v0.3.0, checked
   2026-11-08: each archive has a `.sha256` file beside it; neither installer
   script has one, and arcl's `sha256.sum` lists no installer. fab's archive

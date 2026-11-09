@@ -3,8 +3,8 @@
 //! and reports what differs from the train. It changes nothing.
 //!
 //! Inside a git repository it also asks the repository's [`Host`] whether
-//! stormlight-thunderbot is installed, its secrets are available and
-//! `storm/review` is required on `main`.
+//! the App `.github/fabrial.toml` names is installed, its secrets are
+//! available and `storm/review` is required on `main`.
 //!
 //! Every input comes in through [`Machine`] and [`Host`], so tests build a
 //! `PATH`, a bin directory, Homebrew prefixes and a host of their own.
@@ -19,14 +19,12 @@ use std::time::Duration;
 use crate::host::{Answer, Host};
 use crate::pin::{self, Pin, PinError};
 use crate::process::run_capped;
+use crate::setup::{self, FAB_SETTINGS, LEGACY_SECRET_PREFIX};
 use crate::train::{Tier, Tool, Train};
 
-/// The App whose installation doctor checks: it opens pull requests, posts
-/// review comments and sets `storm/review`.
-pub const APP: &str = "stormlight-thunderbot";
-
-/// The secrets fabrial's workflows read to act as [`APP`].
-pub const SECRETS: [&str; 2] = ["THUNDERBOT_APP_ID", "THUNDERBOT_PRIVATE_KEY"];
+/// The endings of the two secrets fabrial's workflows read to act as the
+/// App, after its secret prefix and an underscore.
+pub const SECRET_SUFFIXES: [&str; 2] = ["APP_ID", "PRIVATE_KEY"];
 
 /// The check that must be required before a pull request merges.
 pub const REVIEW_CHECK: &str = "storm/review";
@@ -177,9 +175,15 @@ pub enum Note {
         /// Why, as "gh not found".
         reason: String,
     },
+    /// Doctor did not check the App or its secrets, since fab's settings
+    /// name no App.
+    SkippedApp {
+        /// Why, as ".github/fabrial.toml names no app".
+        reason: String,
+    },
     /// The host could not answer one check.
     CouldNotCheck {
-        /// What was asked, as "secret THUNDERBOT_APP_ID".
+        /// What was asked, as "secret FABRIAL_APP_ID".
         what: String,
         /// The host's reason.
         reason: String,
@@ -190,6 +194,7 @@ impl fmt::Display for Note {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Note::Skipped { reason } => write!(f, "skipped repository checks: {reason}"),
+            Note::SkippedApp { reason } => write!(f, "skipped the App and secret checks: {reason}"),
             Note::CouldNotCheck { what, reason } => write!(f, "could not check {what}: {reason}"),
         }
     }
@@ -219,6 +224,23 @@ enum PinText {
     Read(String),
     /// Why doctor would not read it.
     Refused(String),
+}
+
+/// The App fabrial's workflows act as, from `.github/fabrial.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct App {
+    /// The App's slug, as in `github.com/apps/<slug>`.
+    pub slug: String,
+    /// The prefix of the secrets holding its ID and key.
+    pub secret_prefix: String,
+}
+
+impl App {
+    /// The secrets the workflows read, `<prefix>_APP_ID` and
+    /// `<prefix>_PRIVATE_KEY`.
+    pub fn secrets(&self) -> [String; 2] {
+        SECRET_SUFFIXES.map(|suffix| format!("{}_{suffix}", self.secret_prefix))
+    }
 }
 
 /// What doctor reads from the machine.
@@ -296,11 +318,14 @@ pub fn check(train: &Train, pin: Option<&RepoPin>, running: &str, machine: &Mach
     report
 }
 
-/// Asks `host` whether [`APP`] is installed, each of [`SECRETS`] is available
+/// Asks `host` whether `app` is installed, each of its secrets is available
 /// and [`BRANCH`] requires [`REVIEW_CHECK`]. A no or a suspension is a
 /// finding; an answer the host could not give is a [`Note::CouldNotCheck`].
-pub fn check_repository(host: &dyn Host, report: &mut Report) {
+/// When `app` is the reason there is none, from [`read_app`], doctor skips
+/// the App and its secrets with a [`Note::SkippedApp`].
+pub fn check_repository(host: &dyn Host, app: Result<&App, &str>, report: &mut Report) {
     report.repository = Some(host.repository());
+    let mut skipped = None;
     let mut record = |answer: Answer, finding: Finding, what: String| match answer {
         Answer::Yes => {}
         Answer::No => report.findings.push(finding),
@@ -310,23 +335,53 @@ pub fn check_repository(host: &dyn Host, report: &mut Report) {
         }),
         Answer::Unknown(reason) => report.notes.push(Note::CouldNotCheck { what, reason }),
     };
-    record(
-        host.app_installed(APP),
-        Finding::AppMissing { app: APP.to_owned() },
-        format!("whether {APP} is installed"),
-    );
-    for name in SECRETS {
-        record(
-            host.secret_available(name),
-            Finding::SecretMissing { name: name.to_owned() },
-            format!("secret {name}"),
-        );
+    match app {
+        Ok(app) => {
+            let slug = &app.slug;
+            record(
+                host.app_installed(slug),
+                Finding::AppMissing { app: slug.clone() },
+                format!("whether {slug} is installed"),
+            );
+            for name in app.secrets() {
+                record(
+                    host.secret_available(&name),
+                    Finding::SecretMissing { name: name.clone() },
+                    format!("secret {name}"),
+                );
+            }
+        }
+        Err(reason) => skipped = Some(Note::SkippedApp { reason: reason.to_owned() }),
     }
     record(
         host.check_required(BRANCH, REVIEW_CHECK),
         Finding::CheckNotRequired { check: REVIEW_CHECK.to_owned(), branch: BRANCH.to_owned() },
         format!("whether {REVIEW_CHECK} is required on {BRANCH}"),
     );
+    report.notes.extend(skipped);
+}
+
+/// The App `.github/fabrial.toml` under `root` names, with its secret
+/// prefix, or why there is none: no file, no `app` key, or a file that is
+/// not TOML. Settings with no `secret_prefix` read the secrets fab 0.9.0
+/// and earlier named, [`LEGACY_SECRET_PREFIX`].
+pub fn read_app(root: &Path) -> Result<App, String> {
+    /// The keys of fab's settings that name the App.
+    #[derive(serde::Deserialize)]
+    struct Settings {
+        app: Option<String>,
+        secret_prefix: Option<String>,
+    }
+    let text = setup::read_small(&root.join(FAB_SETTINGS))
+        .map_err(|reason| format!("{FAB_SETTINGS} {reason}"))?
+        .ok_or_else(|| format!("there is no {FAB_SETTINGS}"))?;
+    let settings: Settings =
+        toml::from_str(&text).map_err(|err| format!("{FAB_SETTINGS} could not be read as TOML: {}", err.message()))?;
+    let slug = settings.app.ok_or_else(|| format!("{FAB_SETTINGS} names no app"))?;
+    let secret_prefix = settings
+        .secret_prefix
+        .unwrap_or_else(|| LEGACY_SECRET_PREFIX.to_owned());
+    Ok(App { slug, secret_prefix })
 }
 
 /// The root of the git repository `start` is in: the nearest directory at or
@@ -563,7 +618,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Finding, Machine, Note, RepoPin, Report, check, check_repository, find_pin_root, parse_version, read_pin,
+        App, Finding, Machine, Note, RepoPin, Report, check, check_repository, find_pin_root, parse_version, read_app,
+        read_pin,
     };
     use crate::host::{Answer, Host};
     use crate::pin::{Pin, PinError};
@@ -683,10 +739,17 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
             }
         }
 
-        /// What doctor finds and notes with this host.
+        /// What doctor finds and notes with this host, for the App
+        /// `bot` with secrets under `BOT`.
         fn report(&self) -> Report {
+            let app = App { slug: "bot".into(), secret_prefix: "BOT".into() };
+            self.report_for(Ok(&app))
+        }
+
+        /// What doctor finds and notes with this host for `app`.
+        fn report_for(&self, app: Result<&App, &str>) -> Report {
             let mut report = Report { checked: Vec::new(), findings: Vec::new(), repository: None, notes: Vec::new() };
-            check_repository(self, &mut report);
+            check_repository(self, app, &mut report);
             report
         }
     }
@@ -704,8 +767,8 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
         fn secret_available(&self, name: &str) -> Answer {
             self.asked.borrow_mut().push(format!("secret {name}"));
             match name {
-                "THUNDERBOT_APP_ID" => self.app_id.clone(),
-                "THUNDERBOT_PRIVATE_KEY" => self.private_key.clone(),
+                "BOT_APP_ID" => self.app_id.clone(),
+                "BOT_PRIVATE_KEY" => self.private_key.clone(),
                 _ => Answer::Unknown(format!("unexpected secret {name}")),
             }
         }
@@ -1150,9 +1213,9 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
         assert_eq!(
             *host.asked.borrow(),
             [
-                "app stormlight-thunderbot",
-                "secret THUNDERBOT_APP_ID",
-                "secret THUNDERBOT_PRIVATE_KEY",
+                "app bot",
+                "secret BOT_APP_ID",
+                "secret BOT_PRIVATE_KEY",
                 "check storm/review on main"
             ]
         );
@@ -1172,9 +1235,9 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
         assert_eq!(
             report.findings.iter().map(|f| f.to_string()).collect::<Vec<_>>(),
             [
-                "stormlight-thunderbot is not installed",
-                "secret THUNDERBOT_APP_ID is not available to this repository",
-                "secret THUNDERBOT_PRIVATE_KEY is not available to this repository",
+                "bot is not installed",
+                "secret BOT_APP_ID is not available to this repository",
+                "secret BOT_PRIVATE_KEY is not available to this repository",
                 "storm/review is not required on main",
             ]
         );
@@ -1182,31 +1245,75 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
         let one = |host: FakeHost| host.report().findings;
         assert_eq!(
             one(FakeHost { app: Answer::No, ..FakeHost::yes() }),
-            [Finding::AppMissing { app: "stormlight-thunderbot".into() }]
+            [Finding::AppMissing { app: "bot".into() }]
         );
         let suspended =
             one(FakeHost { app: Answer::Suspended("its installation on o was suspended".into()), ..FakeHost::yes() });
         assert_eq!(
             suspended,
-            [Finding::AppSuspended {
-                app: "stormlight-thunderbot".into(),
-                reason: "its installation on o was suspended".into()
-            }]
+            [Finding::AppSuspended { app: "bot".into(), reason: "its installation on o was suspended".into() }]
         );
         assert_eq!(
             suspended[0].to_string(),
-            "stormlight-thunderbot cannot act: its installation on o was suspended"
+            "bot cannot act: its installation on o was suspended"
         );
         assert_eq!(
             one(FakeHost { app_id: Answer::No, ..FakeHost::yes() }),
-            [Finding::SecretMissing { name: "THUNDERBOT_APP_ID".into() }]
+            [Finding::SecretMissing { name: "BOT_APP_ID".into() }]
         );
         assert_eq!(
             one(FakeHost { private_key: Answer::No, ..FakeHost::yes() }),
-            [Finding::SecretMissing { name: "THUNDERBOT_PRIVATE_KEY".into() }]
+            [Finding::SecretMissing { name: "BOT_PRIVATE_KEY".into() }]
         );
         assert_eq!(
             one(FakeHost { review: Answer::No, ..FakeHost::yes() }),
+            [Finding::CheckNotRequired { check: "storm/review".into(), branch: "main".into() }]
+        );
+    }
+
+    #[test]
+    fn the_app_and_its_secrets_come_from_fab_settings() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = |text: &str| {
+            std::fs::create_dir_all(root.path().join(".github")).unwrap();
+            std::fs::write(root.path().join(".github/fabrial.toml"), text).unwrap();
+            read_app(root.path())
+        };
+        assert_eq!(
+            read_app(root.path()),
+            Err("there is no .github/fabrial.toml".to_owned())
+        );
+        // The shape fab 0.9.1 writes: lists and a [tasks] table beside the keys.
+        let full = "owner = \"o\"\napp = \"my-bot\"\nsecret_prefix = \"MY_BOT\"\n\
+                    planning = [\".arcl/workspace/\"]\nversion = \"0.9.1\"\n[tasks]\nshow = \"arcl task show {id}\"\n";
+        let app = settings(full).unwrap();
+        assert_eq!(app, App { slug: "my-bot".into(), secret_prefix: "MY_BOT".into() });
+        assert_eq!(app.secrets(), ["MY_BOT_APP_ID", "MY_BOT_PRIVATE_KEY"]);
+        // No prefix reads the secrets fab 0.9.0 and earlier named.
+        let legacy = settings("app = \"stormlight-thunderbot\"\n").unwrap();
+        assert_eq!(legacy.secrets(), ["THUNDERBOT_APP_ID", "THUNDERBOT_PRIVATE_KEY"]);
+        assert_eq!(
+            settings("owner = \"o\"\nversion = \"0.8.0\"\n"),
+            Err(".github/fabrial.toml names no app".to_owned())
+        );
+        assert!(
+            settings("app = ")
+                .unwrap_err()
+                .starts_with(".github/fabrial.toml could not be read as TOML")
+        );
+    }
+
+    #[test]
+    fn without_an_app_doctor_skips_it_and_its_secrets_but_checks_the_branch() {
+        let host = FakeHost { review: Answer::No, ..FakeHost::yes() };
+        let report = host.report_for(Err(".github/fabrial.toml names no app"));
+        assert_eq!(*host.asked.borrow(), ["check storm/review on main"]);
+        assert_eq!(
+            report.notes.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+            ["skipped the App and secret checks: .github/fabrial.toml names no app"]
+        );
+        assert_eq!(
+            report.findings,
             [Finding::CheckNotRequired { check: "storm/review".into(), branch: "main".into() }]
         );
     }
@@ -1224,13 +1331,13 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
         let report = host.report();
         assert_eq!(
             report.findings,
-            [Finding::SecretMissing { name: "THUNDERBOT_PRIVATE_KEY".into() }]
+            [Finding::SecretMissing { name: "BOT_PRIVATE_KEY".into() }]
         );
         assert_eq!(
             report.notes.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
             [
-                "could not check whether stormlight-thunderbot is installed: HTTP 403",
-                "could not check secret THUNDERBOT_APP_ID: no admin access",
+                "could not check whether bot is installed: HTTP 403",
+                "could not check secret BOT_APP_ID: no admin access",
                 "could not check whether storm/review is required on main: timed out",
             ]
         );

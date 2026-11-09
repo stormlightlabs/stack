@@ -12,7 +12,9 @@
 //! adoption leaves no pin and a rerun adopts again.
 //!
 //! Adoption keeps fab's settings: it runs `fab update`, which keeps them,
-//! rather than `fab init`. It replaces a hand-copied session hook, and
+//! rather than `fab init`. Settings from before fab 0.9.0 name no App, and
+//! `fab update` needs one, so adoption passes `--app` to it then, and
+//! `--secret-prefix` when given and the settings name none. It replaces a hand-copied session hook, and
 //! rewrites the one `## Tasks` section outside the markers in place.
 
 use std::ffi::OsStr;
@@ -60,7 +62,8 @@ pub struct Adopt<'a> {
     /// The repository root, where every command runs.
     pub root: &'a Path,
     /// The fab settings given as flags. Each must match fab's settings file,
-    /// which adoption keeps.
+    /// which adoption keeps, or set a value the file lacks: `--app` is
+    /// required when the file names no App.
     pub given: &'a [(Flag, String)],
     /// The optional tools the pin lists.
     pub with: &'a [String],
@@ -101,7 +104,7 @@ impl Adoption {
             out.push_str(&format!("  {}\n", setup::command_line(command)));
         }
         if !self.drift.is_empty() {
-            out.push_str("fab update will rewrite these files, which fab check reports as drifted:\n");
+            out.push_str("fab update will rewrite or remove these files, which fab check reports as drifted:\n");
             for line in &self.drift {
                 out.push_str(&format!("  {line}\n"));
             }
@@ -131,6 +134,12 @@ pub fn adopting(root: &Path) -> Result<bool, SetupError> {
     Ok(!exists(&setup::record_path(root)?))
 }
 
+/// Whether adopting `root` needs `--app`: fab's settings file names no App,
+/// as a file from fab 0.9.0 or earlier does, and `fab update` needs one.
+pub fn needs_app(root: &Path) -> Result<bool, SetupError> {
+    Ok(read_settings(root)?.app.is_none())
+}
+
 /// Works out the adoption of `root` without changing it. Reads fab's
 /// settings and checks the given flags against them, checks that fab and
 /// arcl are on `PATH`, reads this release's archive hashes for the pin,
@@ -140,7 +149,7 @@ pub fn plan(train: &Train, version: &str, adopt: &Adopt) -> Result<Adoption, Set
     if std::fs::symlink_metadata(&pin_path).is_ok() {
         return Err(SetupError::PinExists { path: pin_path });
     }
-    check_settings(adopt)?;
+    let settings = check_settings(adopt)?;
     // Every command below and in apply runs fab or arcl.
     let search = adopt.path.map(OsStr::to_owned).or_else(|| std::env::var_os("PATH"));
     for program in ["fab", "arcl"] {
@@ -162,7 +171,15 @@ pub fn plan(train: &Train, version: &str, adopt: &Adopt) -> Result<Adoption, Set
     let glue = glue::plan(adopt.root, Existing::Replace)?;
 
     let owned = |command: &[&str]| command.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
-    let mut commands = vec![owned(&FAB_UPDATE)];
+    let mut update = owned(&FAB_UPDATE);
+    // A value the file lacks goes to fab update, which writes it; one the
+    // file has matched the flag in check_settings.
+    for (flag, value) in adopt.given {
+        if matches!(flag, Flag::App | Flag::SecretPrefix) && settings.get(*flag).is_none() {
+            update.extend([flag.name().to_owned(), value.clone()]);
+        }
+    }
+    let mut commands = vec![update];
     if std::fs::symlink_metadata(adopt.root.join(".arcl")).is_err() {
         commands.push(owned(&ARCL_INIT));
     }
@@ -277,12 +294,14 @@ pub fn diff(path: &str, old: Option<&str>, new: &str) -> String {
     out
 }
 
-/// The drift `report`, the output of [`FAB_CHECK`], names. fab 0.8.0 prints
-/// one line per drifted file, `missing: <path>` or `differs: <path>`, and
-/// `version: ...` when its settings name another fab, which `fab update`
-/// fixes in [`FAB_SETTINGS`]. When every line has one of these forms the
-/// list holds the paths, each once; otherwise it holds the report's lines
-/// as they are, so nothing fab printed is lost.
+/// The drift `report`, the output of [`FAB_CHECK`], names. fab 0.9.1 prints
+/// one line per drifted file: `missing: <path>` or `differs: <path>`,
+/// `retired: <path>` for a file this release no longer installs, which `fab
+/// update` removes, and two lines about [`FAB_SETTINGS`], which `fab update`
+/// rewrites: `version: ...` when the settings name another fab, and
+/// ``missing: `app` in ...`` when they name no App. When every line has one
+/// of these forms the list holds the paths, each once; otherwise it holds
+/// the report's lines as they are, so nothing fab printed is lost.
 pub fn drift(report: &str) -> Vec<String> {
     let lines: Vec<&str> = report
         .lines()
@@ -291,13 +310,14 @@ pub fn drift(report: &str) -> Vec<String> {
         .collect();
     let mut paths: Vec<String> = Vec::new();
     for line in &lines {
-        let path = if let Some(path) = line
+        let path = if line.starts_with("version: ") || line.starts_with("missing: `app` in ") {
+            FAB_SETTINGS
+        } else if let Some(path) = line
             .strip_prefix("missing: ")
             .or_else(|| line.strip_prefix("differs: "))
+            .or_else(|| line.strip_prefix("retired: "))
         {
             path
-        } else if line.starts_with("version: ") {
-            FAB_SETTINGS
         } else {
             return lines.iter().map(|line| line.to_string()).collect();
         };
@@ -308,33 +328,54 @@ pub fn drift(report: &str) -> Vec<String> {
     paths
 }
 
-/// Checks that fab's settings file can be read and holds the value of each
-/// flag in `adopt.given`.
-fn check_settings(adopt: &Adopt) -> Result<(), SetupError> {
-    /// The keys of fab's settings file that the flags set.
-    #[derive(serde::Deserialize)]
-    struct Settings {
-        owner: Option<String>,
-        trailer: Option<String>,
-        gates: Option<String>,
+/// The keys of fab's settings file that the flags set. The file holds other
+/// keys, lists and a `[tasks]` table, which adoption leaves to fab.
+#[derive(serde::Deserialize)]
+struct Settings {
+    owner: Option<String>,
+    app: Option<String>,
+    secret_prefix: Option<String>,
+    trailer: Option<String>,
+    gates: Option<String>,
+}
+
+impl Settings {
+    /// The value the file holds for `flag`.
+    fn get(&self, flag: Flag) -> Option<&str> {
+        match flag {
+            Flag::Owner => self.owner.as_deref(),
+            Flag::App => self.app.as_deref(),
+            Flag::SecretPrefix => self.secret_prefix.as_deref(),
+            Flag::Trailer => self.trailer.as_deref(),
+            Flag::Gates => self.gates.as_deref(),
+        }
     }
-    let path = adopt.root.join(FAB_SETTINGS);
+}
+
+/// Reads fab's settings file under `root` as TOML.
+fn read_settings(root: &Path) -> Result<Settings, SetupError> {
+    let path = root.join(FAB_SETTINGS);
     let refuse = |reason: String| SetupError::Adopt { path: path.clone(), reason };
     let text = setup::read_small(&path)
         .map_err(refuse)?
         .ok_or_else(|| refuse("is missing".to_owned()))?;
-    let settings: Settings = toml::from_str(&text)
-        .map_err(|err| refuse(format!("could not be read as fab's settings: {}", err.message())))?;
+    toml::from_str(&text).map_err(|err| refuse(format!("could not be read as fab's settings: {}", err.message())))
+}
+
+/// Reads fab's settings file and checks the flags in `adopt.given` against
+/// it: each value must match the file's, except that `--app` and
+/// `--secret-prefix` may give a value the file lacks. The file must name an
+/// App or `--app` must give one.
+fn check_settings(adopt: &Adopt) -> Result<Settings, SetupError> {
+    let settings = read_settings(adopt.root)?;
+    let refuse = |reason: String| SetupError::Adopt { path: adopt.root.join(FAB_SETTINGS), reason };
     let differ: Vec<&str> = adopt
         .given
         .iter()
-        .filter(|(flag, value)| {
-            let held = match flag {
-                Flag::Owner => &settings.owner,
-                Flag::Trailer => &settings.trailer,
-                Flag::Gates => &settings.gates,
-            };
-            held.as_deref() != Some(value.as_str())
+        .filter(|(flag, value)| match settings.get(*flag) {
+            Some(held) => held != value,
+            // fab update writes only these two when the file lacks them.
+            None => !matches!(flag, Flag::App | Flag::SecretPrefix),
         })
         .map(|(flag, _)| flag.name())
         .collect();
@@ -345,7 +386,13 @@ fn check_settings(adopt: &Adopt) -> Result<(), SetupError> {
              or change the file with fab update first"
         )));
     }
-    Ok(())
+    if settings.app.is_none() && !adopt.given.iter().any(|(flag, _)| *flag == Flag::App) {
+        return Err(refuse(
+            "names no app, and fab update needs one. Pass --app with the slug of the repository's GitHub App"
+                .to_owned(),
+        ));
+    }
+    Ok(settings)
 }
 
 /// The lines of `old` and `new` as a list of kept (` `), removed (`-`) and
@@ -415,6 +462,18 @@ mod tests {
             ]
         );
         assert!(drift("").is_empty());
+    }
+
+    #[test]
+    fn drift_reads_retired_files_and_a_missing_app() {
+        // As fab 0.9.1 prints them, from crates/fab-core/src/install.rs.
+        let report = "retired: .claude/skills/implement/SKILL.md\n\
+                      missing: `app` in .github/fabrial.toml; run fab update --app <slug> with the repository's GitHub App\n\
+                      version: installed 0.8.0, this build 0.9.1\n";
+        assert_eq!(
+            drift(report),
+            [".claude/skills/implement/SKILL.md", ".github/fabrial.toml"]
+        );
     }
 
     #[test]
