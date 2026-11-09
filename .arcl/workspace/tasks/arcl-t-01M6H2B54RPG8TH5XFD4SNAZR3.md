@@ -2,7 +2,7 @@
 id = "arcl-t-01M6H2B54RPG8TH5XFD4SNAZR3"
 parent = "arcl-t-01M6H2B51T9ZV42EXGEQ7GQV5X"
 title = "Write the Tasks section and the session hook"
-status = "pending"
+status = "in_progress"
 priority = "normal"
 position = 3
 blocked-by = ["arcl-t-01M6H2B5327WG5DQR0Q41P2DWZ", "arcl-t-01M6H2B546VDAZG9A2RKMMQK00", "arcl-t-01M6H4C5Z4PQ6WKD582Y05H1KJ"]

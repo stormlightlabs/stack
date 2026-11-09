@@ -1,9 +1,11 @@
 //! Repository setup: `sltk init` runs each tool's own setup commands from the
-//! train, passing fab's settings to `fab init`, and then writes the pin.
+//! train, passing fab's settings to `fab init`, writes the glue in [`glue`],
+//! and then writes the pin.
 //!
 //! The pin records the sha256 of each platform's `sltk` archive, copied from
 //! the `.sha256` files on this release, so `init` reads those before it runs
-//! anything. It writes the pin only when every command succeeded.
+//! anything. It writes the pin only when every command succeeded and the
+//! glue is written.
 //!
 //! Before the first command it writes a record of the run, [`RECORD`], in
 //! the repository's git directory, and removes it after the pin. A rerun
@@ -14,6 +16,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
+use crate::glue::{self, GlueError};
 use crate::install::Fetch;
 use crate::pin::{self, Pin, PinError};
 use crate::train::{Platform, Tier, Train};
@@ -136,6 +139,10 @@ pub enum SetupError {
     /// The pin could not be checked or written.
     #[error("sltk: {0}")]
     Pin(#[from] PinError),
+    /// The Tasks section, the session hook or its settings entry could not
+    /// be written.
+    #[error(transparent)]
+    Glue(#[from] GlueError),
     /// A setup command could not be started.
     #[error("sltk: could not run {command} in {}: {source}. {progress}", dir.display())]
     Spawn {
@@ -314,8 +321,8 @@ pub fn commands(train: &Train, settings: &FabSettings, with: &[String]) -> Vec<V
 /// Runs `sltk init`: checks the repository, reads this release's archive
 /// hashes and checks the pin, records the run in the git directory, runs
 /// each of [`commands`] in the repository root, stopping at the first
-/// failure, and then writes the pin and removes the record. Writes the
-/// command lines and the pin's path to `output`.
+/// failure, writes the glue, and then writes the pin and removes the record.
+/// Writes the command lines and the paths it wrote to `output`.
 ///
 /// Refuses a repository that already has a pin, or fab's settings file that
 /// an earlier `init` with the same flags and the train's fab did not leave.
@@ -396,6 +403,9 @@ pub fn init(train: &Train, version: &str, init: Init, output: &mut dyn Write) ->
             return Err(SetupError::Failed { command: line.clone(), status, progress: progress() });
         }
         ran.push(line.clone());
+    }
+    for path in glue::write(init.root)? {
+        let _ = writeln!(output, "wrote {path}");
     }
     pin.write(init.root, train)?;
     let _ = writeln!(output, "wrote {}", pin::PATH);
