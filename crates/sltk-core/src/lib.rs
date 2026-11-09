@@ -1,6 +1,8 @@
 //! Code `sltk` shares between its crates: the release number the CLI reports,
-//! the release train it pins, the install plan and the install itself.
+//! the release train it pins, the install plan, the install itself and the
+//! doctor's checks.
 
+pub mod doctor;
 pub mod install;
 pub mod pin;
 pub mod platform;

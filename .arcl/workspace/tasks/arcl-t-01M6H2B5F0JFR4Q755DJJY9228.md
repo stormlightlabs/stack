@@ -2,10 +2,11 @@
 id = "arcl-t-01M6H2B5F0JFR4Q755DJJY9228"
 parent = "arcl-t-01M6H2B5DNJQDEJ0AVAKFJW534"
 title = "Report machine problems with sltk doctor"
-status = "pending"
+status = "completed"
 priority = "normal"
 position = 0
 blocked-by = ["arcl-t-01M6H2B4ZF2SX34E7YSBVGKWFJ"]
+evidence = "Done in #14 at 3709fea: sltk doctor reports tools missing from the bin dir, versions other than the train's, a PATH binary ahead of the bin dir (marked when from Homebrew), the bin dir missing from PATH and a pin of another release; fake binaries on a constructed PATH cover each."
 +++
 
 A brew-installed tool ahead of the pinned one

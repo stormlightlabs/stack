@@ -716,6 +716,7 @@ name = "sltk-core"
 version = "0.0.0"
 dependencies = [
  "lzma-rs",
+ "rustix",
  "serde",
  "sha2",
  "tar",
