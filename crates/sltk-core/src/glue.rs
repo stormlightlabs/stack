@@ -104,7 +104,7 @@ pub fn tasks_section(existing: Option<&str>) -> Result<String, String> {
             Ok(format!("{text}{gap}{section}"))
         }
         ([begin], [end]) if begin < end => {
-            let after = (end + TASKS_END.len() + 1).min(text.len());
+            let after = text[*end..].find('\n').map_or(text.len(), |at| end + at + 1);
             Ok(format!("{}{section}{}", &text[..*begin], &text[after..]))
         }
         _ => Err(format!(
@@ -151,12 +151,14 @@ pub fn settings(existing: Option<&str>) -> Result<Option<String>, String> {
     Ok(Some(out))
 }
 
-/// The byte offsets of the lines in `text` that are exactly `marker`.
+/// The byte offsets of the lines in `text` that are exactly `marker`, ignoring
+/// a `\n` or `\r\n` ending.
 fn marker_lines(text: &str, marker: &str) -> Vec<usize> {
     let mut offsets = Vec::new();
     let mut start = 0;
     for line in text.split_inclusive('\n') {
-        if line.strip_suffix('\n').unwrap_or(line) == marker {
+        let line_text = line.strip_suffix('\n').unwrap_or(line);
+        if line_text.strip_suffix('\r').unwrap_or(line_text) == marker {
             offsets.push(start);
         }
         start += line.len();
@@ -219,13 +221,13 @@ fn replace(path: &Path, text: &str, mode: Option<u32>) -> Result<(), GlueError> 
     result.map_err(io)
 }
 
-/// Whether `path` has every execute bit the hook's 0755 sets. Always true
-/// off Unix.
+/// Whether `path` has the owner, group and other execute bits, whatever
+/// its other bits. Always true off Unix.
 fn is_executable(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o777 == 0o755)
+        std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 == 0o111)
     }
     #[cfg(not(unix))]
     {
@@ -264,6 +266,14 @@ mod tests {
             got,
             format!("# A\n\n{}\n## B\ntext `{TASKS_BEGIN}` inline\n", section())
         );
+        assert_eq!(tasks_section(Some(&got)).unwrap(), got);
+    }
+
+    #[test]
+    fn markers_on_crlf_lines_are_found_and_replaced() {
+        let text = format!("# A\r\n\r\n{TASKS_BEGIN}\r\nold\r\n{TASKS_END}\r\n\r\n## B\r\n");
+        let got = tasks_section(Some(&text)).unwrap();
+        assert_eq!(got, format!("# A\r\n\r\n{}\r\n## B\r\n", section()));
         assert_eq!(tasks_section(Some(&got)).unwrap(), got);
     }
 

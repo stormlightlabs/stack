@@ -5,8 +5,8 @@ in arcl, in tracked files under `.arcl/workspace`; `arcl.db` is a local cache.
 In a cloud session `.claude/hooks/session-start.sh` installs the `sltk`
 release that `.github/sltk.toml` pins, runs `sltk install --yes` to install
 fab and arcl, and builds the cache in the session's checkout only. Elsewhere,
-run `sltk install`. `sltk init` writes this section and the hook; edits
-between the `sltk:tasks` markers are replaced the next time it runs.
+run `sltk install`. `sltk init` writes this section, between the
+`sltk:tasks` markers, and the hook.
 
 Every task worktree, cloud sessions included, needs `arcl init` before its
 first `arcl` command.

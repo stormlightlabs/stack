@@ -554,6 +554,13 @@ fn the_glue_writers_restore_the_hook_and_keep_the_rest() {
     assert_eq!(glue::write(dir.path()).unwrap(), [glue::HOOK]);
     assert_eq!(std::fs::metadata(&hook).unwrap().permissions().mode() & 0o777, 0o755);
     assert_eq!(glue::write(dir.path()).unwrap(), Vec::<&str>::new());
+
+    // A hook checked out under umask 002 keeps its group write bit.
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o775)).unwrap();
+    assert_eq!(glue::write(dir.path()).unwrap(), Vec::<&str>::new());
+    assert_eq!(std::fs::metadata(&hook).unwrap().permissions().mode() & 0o777, 0o775);
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o754)).unwrap();
+    assert_eq!(glue::write(dir.path()).unwrap(), [glue::HOOK]);
 }
 
 #[test]
