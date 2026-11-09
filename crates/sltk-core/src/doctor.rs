@@ -112,6 +112,14 @@ pub enum Finding {
         /// The App's slug.
         app: String,
     },
+    /// The host says the App is installed, but its installation is
+    /// suspended, so it cannot act.
+    AppSuspended {
+        /// The App's slug.
+        app: String,
+        /// How, as "its installation on owner was suspended at ...".
+        reason: String,
+    },
     /// The host says the repository's workflows cannot read a secret.
     SecretMissing {
         /// The secret's name.
@@ -153,6 +161,7 @@ impl fmt::Display for Finding {
             ),
             Finding::PinRefused { reason } => write!(f, "{reason}; doctor read no pin"),
             Finding::AppMissing { app } => write!(f, "{app} is not installed"),
+            Finding::AppSuspended { app, reason } => write!(f, "{app} cannot act: {reason}"),
             Finding::SecretMissing { name } => write!(f, "secret {name} is not available to this repository"),
             Finding::CheckNotRequired { check, branch } => write!(f, "{check} is not required on {branch}"),
         }
@@ -288,13 +297,17 @@ pub fn check(train: &Train, pin: Option<&RepoPin>, running: &str, machine: &Mach
 }
 
 /// Asks `host` whether [`APP`] is installed, each of [`SECRETS`] is available
-/// and [`BRANCH`] requires [`REVIEW_CHECK`]. A no is a finding; an answer the
-/// host could not give is a [`Note::CouldNotCheck`].
+/// and [`BRANCH`] requires [`REVIEW_CHECK`]. A no or a suspension is a
+/// finding; an answer the host could not give is a [`Note::CouldNotCheck`].
 pub fn check_repository(host: &dyn Host, report: &mut Report) {
     report.repository = Some(host.repository());
     let mut record = |answer: Answer, finding: Finding, what: String| match answer {
         Answer::Yes => {}
         Answer::No => report.findings.push(finding),
+        Answer::Suspended(reason) => report.findings.push(match finding {
+            Finding::AppMissing { app } => Finding::AppSuspended { app, reason },
+            other => other,
+        }),
         Answer::Unknown(reason) => report.notes.push(Note::CouldNotCheck { what, reason }),
     };
     record(
@@ -1170,6 +1183,19 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
         assert_eq!(
             one(FakeHost { app: Answer::No, ..FakeHost::yes() }),
             [Finding::AppMissing { app: "stormlight-thunderbot".into() }]
+        );
+        let suspended =
+            one(FakeHost { app: Answer::Suspended("its installation on o was suspended".into()), ..FakeHost::yes() });
+        assert_eq!(
+            suspended,
+            [Finding::AppSuspended {
+                app: "stormlight-thunderbot".into(),
+                reason: "its installation on o was suspended".into()
+            }]
+        );
+        assert_eq!(
+            suspended[0].to_string(),
+            "stormlight-thunderbot cannot act: its installation on o was suspended"
         );
         assert_eq!(
             one(FakeHost { app_id: Answer::No, ..FakeHost::yes() }),

@@ -4,6 +4,9 @@
 //!
 //! [`Host`] is the interface and [`GitHub`] its one implementation, which asks
 //! through `gh api`. Tests use a fake.
+//!
+//! When `origin` is a fork, the questions are about its parent, since the
+//! workflows that need the App, the secrets and the required check run there.
 
 use std::cell::OnceCell;
 use std::ffi::OsStr;
@@ -34,6 +37,9 @@ pub enum Answer {
     Yes,
     /// It is not so.
     No,
+    /// It is so, but suspended, and how: an App installation that an owner
+    /// or GitHub suspended cannot act, so doctor counts it as a no.
+    Suspended(String),
     /// The host could not say, and why, as when the token may not list
     /// secrets.
     Unknown(String),
@@ -62,10 +68,11 @@ impl ApiError {
 pub struct GitHub {
     /// The `gh` binary, from an absolute `PATH` entry.
     gh: PathBuf,
-    /// The account that owns the repository.
-    owner: String,
-    /// The repository's name, without `.git`.
-    repo: String,
+    /// The repository `origin` names, as "owner/repo".
+    origin: String,
+    /// The repository asked about: `origin`'s, or its parent when it is a
+    /// fork. Else why neither could be read, which every answer repeats.
+    target: Result<Target, String>,
     /// How long each `gh api` call may run.
     timeout: Duration,
     /// How long all the calls may run together, from [`GitHub::detect`].
@@ -79,11 +86,12 @@ pub struct GitHub {
 
 impl GitHub {
     /// The GitHub repository the remote `origin` of the git repository at
-    /// `root` names, asked about through the `gh` on `path`. `gh` and `git`
-    /// are found in absolute `PATH` entries only. Each call may run for
-    /// `timeout`, and all of them, this one's `git` included, for `total`.
-    /// The error is why doctor skips the repository checks: `gh` or `git` is
-    /// not on `path`, there is no `origin`, or `origin` is not on GitHub.
+    /// `root` names, or its parent when it is a fork, asked about through the
+    /// `gh` on `path`. `gh` and `git` are found in absolute `PATH` entries
+    /// only. Each call may run for `timeout`, and all of them, this one's
+    /// `git` and `gh api` included, for `total`. The error is why doctor
+    /// skips the repository checks: `gh` or `git` is not on `path`, there is
+    /// no `origin`, or `origin` is not on GitHub.
     pub fn detect(root: &Path, path: Option<&OsStr>, timeout: Duration, total: Duration) -> Result<GitHub, String> {
         let deadline = Instant::now() + total;
         let gh = find_program("gh", path).ok_or("gh not found")?;
@@ -99,7 +107,40 @@ impl GitHub {
             return Err("no remote named origin".to_owned());
         }
         let (owner, repo) = parse_remote(output.stdout.trim()).ok_or("origin is not a GitHub repository")?;
-        Ok(GitHub { gh, owner, repo, timeout, total, deadline, secrets: OnceCell::new() })
+        let mut github = GitHub {
+            gh,
+            origin: format!("{owner}/{repo}"),
+            target: Err(String::new()),
+            timeout,
+            total,
+            deadline,
+            secrets: OnceCell::new(),
+        };
+        github.target = github.resolve();
+        Ok(github)
+    }
+
+    /// Reads `origin`'s repository: itself when it is not a fork, else its
+    /// parent, or why GitHub did not say.
+    fn resolve(&self) -> Result<Target, String> {
+        let origin = &self.origin;
+        let lines = self
+            .api(&format!("repos/{origin}"), r#""\(.fork) \(.parent.full_name // "")""#)
+            .map_err(|err| err.reason().to_owned())?;
+        let (full_name, fork) = match lines.first().and_then(|line| line.split_once(' ')) {
+            Some(("false", _)) => (origin.as_str(), false),
+            Some(("true", parent)) => (parent, true),
+            _ => return Err(format!("GitHub did not say whether {origin} is a fork")),
+        };
+        let (owner, repo) = split_full_name(full_name)
+            .ok_or_else(|| format!("{origin} is a fork, and GitHub did not name its parent"))?;
+        Ok(Target { owner, repo, fork })
+    }
+
+    /// The repository asked about, or the answer every question gets when it
+    /// is not known.
+    fn target(&self) -> Result<&Target, Answer> {
+        self.target.as_ref().map_err(|reason| Answer::Unknown(reason.clone()))
     }
 
     /// Runs `gh api` on `endpoint`, every page, filtered by `jq`, and returns
@@ -143,15 +184,12 @@ impl GitHub {
     }
 
     /// The repository's own secrets and the organization secrets shared
-    /// with it, listed on the first call and kept for the rest.
-    fn secret_lists(&self) -> &[Result<Vec<String>, String>; 2] {
+    /// with `target`, listed on the first call and kept for the rest.
+    fn secret_lists(&self, target: &Target) -> &[Result<Vec<String>, String>; 2] {
         self.secrets.get_or_init(|| {
             [
-                self.secret_names(&format!("repos/{}/{}/actions/secrets", self.owner, self.repo)),
-                self.secret_names(&format!(
-                    "repos/{}/{}/actions/organization-secrets",
-                    self.owner, self.repo
-                )),
+                self.secret_names(&format!("repos/{target}/actions/secrets")),
+                self.secret_names(&format!("repos/{target}/actions/organization-secrets")),
             ]
         })
     }
@@ -159,30 +197,42 @@ impl GitHub {
 
 impl Host for GitHub {
     fn repository(&self) -> String {
-        format!("{}/{} on GitHub", self.owner, self.repo)
+        match &self.target {
+            Ok(target) if target.fork => format!("{target} on GitHub, the parent of the fork {}", self.origin),
+            _ => format!("{} on GitHub", self.origin),
+        }
     }
 
     /// Lists the organization's installations, which a token with
     /// `read:org` may see when its user is an organization owner. GitHub
     /// shows a user account's installations, and the repositories an
     /// installation on selected repositories covers, only to the App, so
-    /// those are [`Answer::Unknown`].
+    /// those are [`Answer::Unknown`]. A suspended installation is
+    /// [`Answer::Suspended`], whatever repositories it covers.
     fn app_installed(&self, app: &str) -> Answer {
-        let endpoint = format!("orgs/{}/installations", self.owner);
+        let target = match self.target() {
+            Ok(target) => target,
+            Err(answer) => return answer,
+        };
+        let owner = &target.owner;
         match self.api(
-            &endpoint,
-            r#".installations[] | "\(.app_slug) \(.repository_selection)""#,
+            &format!("orgs/{owner}/installations"),
+            r#".installations[] | "\(.app_slug) \(.repository_selection) \(.suspended_at // "")""#,
         ) {
             Ok(lines) => {
-                let selection = lines.iter().find_map(|line| {
-                    let (slug, selection) = line.split_once(' ')?;
-                    (slug == app).then_some(selection)
+                let installation = lines.iter().find_map(|line| {
+                    let mut parts = line.splitn(3, ' ');
+                    let slug = parts.next()?;
+                    (slug == app).then(|| (parts.next().unwrap_or(""), parts.next().unwrap_or("")))
                 });
-                match selection {
-                    Some("all") => Answer::Yes,
+                match installation {
+                    Some((_, suspended)) if !suspended.is_empty() => Answer::Suspended(format!(
+                        "its installation on {owner} was suspended at {}",
+                        clean(suspended)
+                    )),
+                    Some(("all", _)) => Answer::Yes,
                     Some(_) => Answer::Unknown(format!(
-                        "it is installed on selected repositories of {}, and GitHub shows which only to the App",
-                        self.owner
+                        "it is installed on selected repositories of {owner}, and GitHub shows which only to the App"
                     )),
                     None => Answer::No,
                 }
@@ -198,24 +248,28 @@ impl Host for GitHub {
     /// shared with it, which are listed once for all the secrets asked about.
     /// Listing either needs admin access to the repository.
     fn secret_available(&self, name: &str) -> Answer {
-        find_in(self.secret_lists().clone(), name)
+        match self.target() {
+            Ok(target) => find_in(self.secret_lists(target).clone(), name),
+            Err(answer) => answer,
+        }
     }
 
     /// Looks in the rulesets that apply to `branch` and in its classic branch
     /// protection. A 404 saying the branch is not protected, or has no
     /// required checks, means classic protection requires nothing.
     fn check_required(&self, branch: &str, check: &str) -> Answer {
+        let target = match self.target() {
+            Ok(target) => target,
+            Err(answer) => return answer,
+        };
         let rules = self
             .api(
-                &format!("repos/{}/{}/rules/branches/{branch}", self.owner, self.repo),
+                &format!("repos/{target}/rules/branches/{branch}"),
                 r#".[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context"#,
             )
             .map_err(|err| err.reason().to_owned());
         let classic = match self.api(
-            &format!(
-                "repos/{}/{}/branches/{branch}/protection/required_status_checks",
-                self.owner, self.repo
-            ),
+            &format!("repos/{target}/branches/{branch}/protection/required_status_checks"),
             "(.contexts // [])[], ((.checks // [])[] | .context)",
         ) {
             Ok(contexts) => Ok(contexts),
@@ -225,6 +279,23 @@ impl Host for GitHub {
             Err(err) => Err(err.reason().to_owned()),
         };
         find_in([rules, classic], check)
+    }
+}
+
+/// A repository on GitHub that [`GitHub`] asks about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Target {
+    /// The account that owns the repository.
+    owner: String,
+    /// The repository's name, without `.git`.
+    repo: String,
+    /// Whether this is the parent of the fork `origin` names.
+    fork: bool,
+}
+
+impl std::fmt::Display for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.owner, self.repo)
     }
 }
 
@@ -244,8 +315,9 @@ pub trait Host {
 
 /// The owner and name of the GitHub repository a git remote URL names:
 /// `https://github.com/owner/repo`, `git@github.com:owner/repo` or
-/// `ssh://git@github.com/owner/repo`, each with an optional `.git`. Any other
-/// host, or a path that is not two parts, gives `None`.
+/// `ssh://git@github.com/owner/repo`, each with an optional `.git`, and a
+/// URL with a scheme may give a port after the host. Any other host, or a
+/// path that is not two parts, gives `None`.
 pub fn parse_remote(url: &str) -> Option<(String, String)> {
     let (rest, sep) = match url.split_once("://") {
         Some((scheme, rest)) if ["https", "http", "ssh", "git"].contains(&scheme) => (rest, '/'),
@@ -254,12 +326,21 @@ pub fn parse_remote(url: &str) -> Option<(String, String)> {
     };
     let (authority, path) = rest.split_once(sep)?;
     let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let host = match host.rsplit_once(':') {
+        Some((name, port)) if sep == '/' && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => host,
+    };
     if !host.eq_ignore_ascii_case("github.com") {
         return None;
     }
     let path = path.trim_end_matches('/');
-    let path = path.strip_suffix(".git").unwrap_or(path);
-    let (owner, repo) = path.split_once('/')?;
+    split_full_name(path.strip_suffix(".git").unwrap_or(path))
+}
+
+/// The owner and name in `owner/repo`, each made of the characters GitHub
+/// allows in a name, or `None`.
+fn split_full_name(full_name: &str) -> Option<(String, String)> {
+    let (owner, repo) = full_name.split_once('/')?;
     let name = |part: &str| {
         !part.is_empty()
             && part != "."
@@ -315,6 +396,8 @@ mod tests {
             "git@github.com:stormlightlabs/stack",
             "ssh://git@github.com/stormlightlabs/stack.git",
             "https://GitHub.com/stormlightlabs/stack",
+            "ssh://git@github.com:22/stormlightlabs/stack.git",
+            "https://github.com:443/stormlightlabs/stack",
         ] {
             assert_eq!(parse_remote(url), pair("stormlightlabs", "stack"), "{url}");
         }
@@ -322,6 +405,9 @@ mod tests {
         for url in [
             "https://gitlab.com/stormlightlabs/stack",
             "https://github.com.evil.test/stormlightlabs/stack",
+            "https://github.com:/stormlightlabs/stack",
+            "https://github.com:x22/stormlightlabs/stack",
+            "ssh://git@github.com:stormlightlabs/stack",
             "https://github.com/stormlightlabs",
             "https://github.com/stormlightlabs/stack/tree/main",
             "https://github.com//stack",
