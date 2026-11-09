@@ -2,7 +2,7 @@
 id = "arcl-t-01M6H2B56F01QNVYY5C5K1CPPH"
 parent = "arcl-t-01M6H2B557EB9CNG08ACBRPG1P"
 title = "Adopt a set-up repository with a diff first"
-status = "pending"
+status = "in_progress"
 priority = "normal"
 position = 0
 blocked-by = ["arcl-t-01M6H2B54RPG8TH5XFD4SNAZR3"]

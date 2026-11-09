@@ -317,8 +317,8 @@ fn matching_fab_settings_without_a_record_are_refused_before_any_download() {
     assert!(
         err.ends_with(
             "/.github/fabrial.toml was not written by an earlier sltk init; \
-             sltk cannot adopt a repository set up by hand yet \
-             (planned in the stack task \"Adopt repositories set up by hand\")"
+             to adopt the repository with the settings it has, remove sltk-init from the git directory \
+             and rerun sltk init without --owner, --trailer and --gates"
         ),
         "{err}"
     );
@@ -412,8 +412,8 @@ fn fab_settings_with_other_values_are_refused_before_any_download() {
     assert!(
         err.ends_with(
             "/.github/fabrial.toml holds other values for --trailer, --gates; \
-             sltk cannot adopt a repository set up by hand yet \
-             (planned in the stack task \"Adopt repositories set up by hand\")"
+             to adopt the repository with the settings it has, remove sltk-init from the git directory \
+             and rerun sltk init without --owner, --trailer and --gates"
         ),
         "{err}"
     );
@@ -588,8 +588,8 @@ fn a_hook_sltk_did_not_write_is_refused_and_nothing_is_written() {
     assert_eq!(
         err,
         format!(
-            "sltk: {}: differs from the hook sltk writes, and sltk does not replace it. Adopting an \
-             existing hook comes in a later release; until then, move this one aside and rerun sltk init",
+            "sltk: {}: differs from the hook sltk writes, and sltk init replaces a hook only when it \
+             adopts a repository that has .github/fabrial.toml. Move this one aside and rerun sltk init",
             hook.display()
         )
     );

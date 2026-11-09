@@ -1,7 +1,8 @@
 //! The glue `sltk init` writes itself: the Tasks section in AGENTS.md, the
 //! session hook, and the hook's entry in `.claude/settings.json`.
 //!
-//! Each writer leaves a file alone when it already holds what it would
+//! [`plan`] reads the files and works out each change; [`apply`] writes
+//! them. Each writer leaves a file alone when it already holds what it would
 //! write, so a second run changes no byte. None follows a symlink, whether
 //! it is the file or a directory between the repository root and the file,
 //! so every write lands inside the repository. Every file is checked before
@@ -13,6 +14,11 @@ use std::path::{Path, PathBuf};
 /// Where the Tasks section goes, relative to the repository root.
 pub const AGENTS: &str = "AGENTS.md";
 
+/// Where the Tasks section goes in a repository that has this file and no
+/// AGENTS.md. Claude Code reads CLAUDE.md and not AGENTS.md, so a new
+/// AGENTS.md beside it would hold a section no agent there loads.
+pub const CLAUDE: &str = "CLAUDE.md";
+
 /// Where the session hook goes, relative to the repository root.
 pub const HOOK: &str = ".claude/hooks/session-start.sh";
 
@@ -22,6 +28,11 @@ pub const SETTINGS: &str = ".claude/settings.json";
 /// The command the SessionStart entry runs.
 /// The variable is quoted so a project path with a space stays one word.
 pub const HOOK_COMMAND: &str = "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session-start.sh";
+
+/// The command a hand-copied SessionStart entry runs for the same hook,
+/// without the quotes. The settings writer rewrites it to [`HOOK_COMMAND`]
+/// rather than add a second entry that would run the hook twice.
+pub const UNQUOTED_HOOK_COMMAND: &str = "$CLAUDE_PROJECT_DIR/.claude/hooks/session-start.sh";
 
 /// The line that opens the Tasks section in AGENTS.md.
 pub const TASKS_BEGIN: &str = "<!-- sltk:tasks:begin -->";
@@ -38,6 +49,20 @@ pub const TASKS: &str = include_str!("../templates/tasks.md");
 /// `.claude/settings.json` for a repository that has none. Its one
 /// SessionStart entry is the one [`settings`] adds to an existing file.
 pub const SETTINGS_TEMPLATE: &str = include_str!("../templates/settings.json");
+
+/// The mode the hook is written with.
+const HOOK_MODE: u32 = 0o755;
+
+/// What the writers do with glue that sltk did not write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Existing {
+    /// Refuse a hook that differs from [`HOOK_SCRIPT`] and a `## Tasks`
+    /// section outside the markers. Fresh setup does this.
+    Refuse,
+    /// Replace the hook, and the one `## Tasks` section outside the markers
+    /// with the marked one. Adoption does this, after showing the diff.
+    Replace,
+}
 
 /// Why a glue file could not be written.
 #[derive(Debug, thiserror::Error)]
@@ -56,44 +81,87 @@ pub enum GlueError {
     Content { path: PathBuf, reason: String },
 }
 
+/// One glue file [`plan`] would write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change {
+    /// The file, relative to the repository root.
+    pub path: &'static str,
+    /// Its text now, or `None` when there is no file.
+    pub old: Option<String>,
+    /// The text it gets.
+    pub new: String,
+    /// Its Unix permission bits now, when it exists and sltk sets its mode.
+    pub old_mode: Option<u32>,
+    /// The Unix permission bits it gets, or `None` to leave them to the
+    /// umask.
+    pub mode: Option<u32>,
+}
+
 /// Writes the Tasks section, the hook and its settings entry under `root`,
 /// and returns the paths, relative to `root`, of the files it changed.
 ///
 /// Refuses a hook that differs from [`HOOK_SCRIPT`] rather than replace it.
 /// It checks all three files before writing any.
 pub fn write(root: &Path) -> Result<Vec<&'static str>, GlueError> {
+    apply(root, &plan(root, Existing::Refuse)?)
+}
+
+/// The changes the glue writers would make under `root`, without writing
+/// anything. `existing` says what to do with a hook or a Tasks section sltk
+/// did not write.
+pub fn plan(root: &Path, existing: Existing) -> Result<Vec<Change>, GlueError> {
     let content = |relative: &str| {
         let path = root.join(relative);
         move |reason| GlueError::Content { path, reason }
     };
-    let agents = read(root, AGENTS)?;
-    let agents_text = tasks_section(agents.as_deref()).map_err(content(AGENTS))?;
+    let target = tasks_file(root)?;
+    let agents = read(root, target)?;
+    let agents_text = tasks_section_with(agents.as_deref(), existing).map_err(content(target))?;
     let hook = read(root, HOOK)?;
-    if hook.as_deref().is_some_and(|text| text != HOOK_SCRIPT) {
+    if existing == Existing::Refuse && hook.as_deref().is_some_and(|text| text != HOOK_SCRIPT) {
         return Err(content(HOOK)(
-            "differs from the hook sltk writes, and sltk does not replace it. Adopting an existing hook \
-             comes in a later release; until then, move this one aside and rerun sltk init"
+            "differs from the hook sltk writes, and sltk init replaces a hook only when it adopts a \
+             repository that has .github/fabrial.toml. Move this one aside and rerun sltk init"
                 .to_owned(),
         ));
     }
-    let existing = read(root, SETTINGS)?;
-    let merged = settings(existing.as_deref()).map_err(content(SETTINGS))?;
+    let settings_text = read(root, SETTINGS)?;
+    let merged = settings(settings_text.as_deref()).map_err(content(SETTINGS))?;
 
-    let mut changed = Vec::new();
+    let mut changes = Vec::new();
     if agents.as_deref() != Some(agents_text.as_str()) {
-        replace(&root.join(AGENTS), &agents_text, None)?;
-        changed.push(AGENTS);
+        changes.push(Change { path: target, old: agents, new: agents_text, old_mode: None, mode: None });
     }
-    let path = root.join(HOOK);
-    if hook.is_none() || !is_executable(&path) {
-        replace(&path, HOOK_SCRIPT, Some(0o755))?;
-        changed.push(HOOK);
+    let old_mode = hook.as_ref().and_then(|_| mode_of(&root.join(HOOK)));
+    if hook.as_deref() != Some(HOOK_SCRIPT) || !old_mode.is_none_or(|mode| mode & 0o111 == 0o111) {
+        changes.push(Change { path: HOOK, old: hook, new: HOOK_SCRIPT.to_owned(), old_mode, mode: Some(HOOK_MODE) });
     }
     if let Some(text) = merged {
-        replace(&root.join(SETTINGS), &text, None)?;
-        changed.push(SETTINGS);
+        changes.push(Change { path: SETTINGS, old: settings_text, new: text, old_mode: None, mode: None });
     }
-    Ok(changed)
+    Ok(changes)
+}
+
+/// Writes each change under `root`, and returns the paths it wrote.
+pub fn apply(root: &Path, changes: &[Change]) -> Result<Vec<&'static str>, GlueError> {
+    let mut written = Vec::new();
+    for change in changes {
+        replace(&root.join(change.path), &change.new, change.mode)?;
+        written.push(change.path);
+    }
+    Ok(written)
+}
+
+/// The file the Tasks section goes in: [`AGENTS`], or [`CLAUDE`] when the
+/// repository has that and no AGENTS.md.
+pub fn tasks_file(root: &Path) -> Result<&'static str, GlueError> {
+    if kind_or_link(&root.join(AGENTS))? {
+        return Ok(AGENTS);
+    }
+    if kind_or_link(&root.join(CLAUDE))? {
+        return Ok(CLAUDE);
+    }
+    Ok(AGENTS)
 }
 
 /// AGENTS.md with the Tasks section in it: `existing` with the text between
@@ -103,13 +171,22 @@ pub fn write(root: &Path) -> Result<Vec<&'static str>, GlueError> {
 /// once, or out of order, and when a `## Tasks` heading lies outside the
 /// markers, since the file would then hold two Tasks sections.
 pub fn tasks_section(existing: Option<&str>) -> Result<String, String> {
+    tasks_section_with(existing, Existing::Refuse)
+}
+
+/// [`tasks_section`], except that with [`Existing::Replace`] a file with no
+/// markers and one `## Tasks` heading has that section replaced in place:
+/// the heading line up to the next heading of level one or two outside a
+/// code fence, or the end of the file.
+pub fn tasks_section_with(existing: Option<&str>, policy: Existing) -> Result<String, String> {
     let section = format!("{TASKS_BEGIN}\n{TASKS}{TASKS_END}\n");
     let Some(text) = existing.filter(|text| !text.is_empty()) else {
         return Ok(section);
     };
     let begins = marker_lines(text, TASKS_BEGIN);
     let ends = marker_lines(text, TASKS_END);
-    let heading_outside = |from: usize, to: usize| tasks_headings(text).into_iter().any(|at| at < from || at >= to);
+    let headings = tasks_headings(text);
+    let heading_outside = |from: usize, to: usize| headings.iter().any(|&at| at < from || at >= to);
     let two_sections = || {
         format!(
             "has a ## Tasks heading outside the {TASKS_BEGIN} and {TASKS_END} lines, so sltk would add a \
@@ -118,6 +195,17 @@ pub fn tasks_section(existing: Option<&str>) -> Result<String, String> {
         )
     };
     match (begins.as_slice(), ends.as_slice()) {
+        ([], []) if policy == Existing::Replace && headings.len() == 1 => {
+            let start = headings[0];
+            let end = section_end(text, start);
+            let gap = if end < text.len() { "\n" } else { "" };
+            Ok(format!("{}{section}{gap}{}", &text[..start], &text[end..]))
+        }
+        ([], []) if policy == Existing::Replace && headings.len() > 1 => Err(format!(
+            "has {} ## Tasks headings and no {TASKS_BEGIN} line, so sltk cannot tell which section to \
+             replace. Delete all but one",
+            headings.len()
+        )),
         ([], []) if heading_outside(0, 0) => Err(two_sections()),
         ([begin], [end]) if begin < end && heading_outside(*begin, *end) => Err(two_sections()),
         ([], []) => {
@@ -144,7 +232,8 @@ pub fn tasks_section(existing: Option<&str>) -> Result<String, String> {
 /// when `existing` already runs [`HOOK_COMMAND`] at SessionStart. A missing
 /// file becomes [`SETTINGS_TEMPLATE`]. An existing file keeps its other keys
 /// and hooks in their order and gains the entry at the end of
-/// `hooks.SessionStart`.
+/// `hooks.SessionStart`, unless an entry there runs
+/// [`UNQUOTED_HOOK_COMMAND`]: that entry gets [`HOOK_COMMAND`] in place.
 ///
 /// The new text is serde_json's, not an edit of the old bytes: it is
 /// indented with two spaces, a repeated key keeps only its last value, and
@@ -169,15 +258,28 @@ pub fn settings(existing: Option<&str>) -> Result<Option<String>, String> {
         .or_insert_with(|| serde_json::Value::Array(Vec::new()))
         .as_array_mut()
         .ok_or("hooks.SessionStart is not a JSON array")?;
+    let mut rewrote = false;
+    for hook in start
+        .iter_mut()
+        .filter_map(|group| group.get_mut("hooks").and_then(serde_json::Value::as_array_mut))
+        .flatten()
+    {
+        if hook["command"] == UNQUOTED_HOOK_COMMAND {
+            hook["command"] = serde_json::Value::from(HOOK_COMMAND);
+            rewrote = true;
+        }
+    }
     let runs_hook = start.iter().any(|group| {
         group["hooks"]
             .as_array()
             .is_some_and(|list| list.iter().any(|hook| hook["command"] == HOOK_COMMAND))
     });
-    if runs_hook {
+    if runs_hook && !rewrote {
         return Ok(None);
     }
-    start.push(entry);
+    if !runs_hook {
+        start.push(entry);
+    }
     let mut out = serde_json::to_string_pretty(&root).expect("a JSON value serializes");
     out.push('\n');
     Ok(Some(out))
@@ -199,6 +301,28 @@ fn tasks_headings(text: &str) -> Vec<usize> {
         start += line.len();
     }
     offsets
+}
+
+/// The byte offset where the section whose heading starts at `start` ends:
+/// the next line, outside a code fence, that is a heading of level one or
+/// two, or the end of `text`.
+fn section_end(text: &str, start: usize) -> usize {
+    let mut at = start;
+    let mut fenced = false;
+    for (i, line) in text[start..].split_inclusive('\n').enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fenced = !fenced;
+        } else if i > 0 && !fenced {
+            let level = trimmed.bytes().take_while(|&b| b == b'#').count();
+            let rest = &trimmed[level..];
+            if (level == 1 || level == 2) && (rest.is_empty() || rest.starts_with(char::is_whitespace)) {
+                return at;
+            }
+        }
+        at += line.len();
+    }
+    text.len()
 }
 
 /// The byte offsets of the lines in `text` that are exactly `marker`, ignoring
@@ -290,24 +414,38 @@ fn replace(path: &Path, text: &str, mode: Option<u32>) -> Result<(), GlueError> 
     result.map_err(io)
 }
 
-/// Whether `path` has the owner, group and other execute bits, whatever
-/// its other bits. Always true off Unix.
-fn is_executable(path: &Path) -> bool {
+/// The permission bits of the file at `path`, after symlinks, or `None` off
+/// Unix or when it cannot be read.
+fn mode_of(path: &Path) -> Option<u32> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 == 0o111)
+        std::fs::metadata(path)
+            .ok()
+            .map(|meta| meta.permissions().mode() & 0o7777)
     }
     #[cfg(not(unix))]
     {
         let _ = path;
-        true
+        None
+    }
+}
+
+/// Whether anything, a symlink included, is at `path`.
+fn kind_or_link(path: &Path) -> Result<bool, GlueError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(GlueError::Io { path: path.to_owned(), source }),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{HOOK_COMMAND, SETTINGS_TEMPLATE, TASKS, TASKS_BEGIN, TASKS_END, settings, tasks_section};
+    use super::{
+        Existing, HOOK_COMMAND, SETTINGS_TEMPLATE, TASKS, TASKS_BEGIN, TASKS_END, UNQUOTED_HOOK_COMMAND, settings,
+        tasks_section, tasks_section_with,
+    };
 
     fn section() -> String {
         format!("{TASKS_BEGIN}\n{TASKS}{TASKS_END}\n")
@@ -376,6 +514,49 @@ mod tests {
         ] {
             assert!(tasks_section(Some(&text)).is_ok(), "{text:?}");
         }
+    }
+
+    #[test]
+    fn adoption_replaces_an_unmarked_section_up_to_the_next_heading() {
+        let replace = |text: &str| tasks_section_with(Some(text), Existing::Replace).unwrap();
+        let old = "## Tasks\n\nold\n\n```md\n# not a heading\n## nor this\n```\n\n### Sub\n\nmore\n\n";
+        assert_eq!(
+            replace(&format!("# A\n\n{old}## B\n\nkept\n")),
+            format!("# A\n\n{}\n## B\n\nkept\n", section())
+        );
+        assert_eq!(
+            replace(&format!("# A\n\n{old}# C\n")),
+            format!("# A\n\n{}\n# C\n", section())
+        );
+        assert_eq!(replace(&format!("# A\n\n{old}")), format!("# A\n\n{}", section()));
+        let got = replace(&format!("# A\n\n{old}## B\n"));
+        assert_eq!(replace(&got), got);
+        // Fresh setup still refuses the same file.
+        assert!(tasks_section(Some(&format!("# A\n\n{old}"))).is_err());
+    }
+
+    #[test]
+    fn adoption_refuses_two_unmarked_sections_or_one_beside_the_markers() {
+        let replace = |text: &str| tasks_section_with(Some(text), Existing::Replace);
+        let err = replace("## Tasks\n\na\n\n## Tasks\n\nb\n").unwrap_err();
+        assert!(err.starts_with("has 2 ## Tasks headings"), "{err}");
+        let err = replace(&format!("## Tasks\n\n{TASKS_BEGIN}\nold\n{TASKS_END}\n")).unwrap_err();
+        assert!(err.starts_with("has a ## Tasks heading outside"), "{err}");
+    }
+
+    #[test]
+    fn an_unquoted_entry_for_the_hook_is_quoted_in_place() {
+        let text = format!(
+            r#"{{"hooks": {{"SessionStart": [{{"hooks": [{{"type": "command", "command": "a.sh"}}, {{"type": "command", "command": "{}"}}]}}]}}}}"#,
+            UNQUOTED_HOOK_COMMAND
+        );
+        let got = settings(Some(&text)).unwrap().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&got).unwrap();
+        let start = value["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(start.len(), 1);
+        assert_eq!(start[0]["hooks"][0]["command"], "a.sh");
+        assert_eq!(start[0]["hooks"][1]["command"], HOOK_COMMAND);
+        assert_eq!(settings(Some(&got)).unwrap(), None);
     }
 
     #[test]

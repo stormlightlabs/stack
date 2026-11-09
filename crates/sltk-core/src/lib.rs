@@ -1,8 +1,10 @@
 //! Code `sltk` shares between its crates: the release number the CLI reports,
 //! the release train it pins, the install plan, the install itself, the
 //! doctor's checks, the repository's host, capped child processes,
-//! repository setup and the glue it writes.
+//! repository setup, the adoption of a repository set up by hand, and the
+//! glue both write.
 
+pub mod adopt;
 pub mod doctor;
 pub mod glue;
 pub mod host;

@@ -14,11 +14,11 @@ const LINE_BYTES: u64 = 4096;
 /// The question [`pick`] asks after it lists the tools.
 const PICK_QUESTION: &str = "Add which? Numbers or names, Enter for none: ";
 
-/// Writes `question` and reads one line of answer. Enter, `y` and `yes` mean
-/// yes; `n` and `no` mean no, in any case. Any other answer, including one
-/// that is not UTF-8, asks again, up to [`ASKS`] times in all, and then counts
-/// as no. End of input counts as no.
-pub fn confirm(input: &mut impl BufRead, output: &mut impl Write, question: &str) -> io::Result<bool> {
+/// Writes `question` and reads one line of answer. `y` and `yes` mean yes;
+/// `n` and `no` mean no, in any case; Enter means `enter`. Any other answer,
+/// including one that is not UTF-8, asks again, up to [`ASKS`] times in all,
+/// and then counts as no. End of input counts as no.
+pub fn confirm(input: &mut impl BufRead, output: &mut impl Write, question: &str, enter: bool) -> io::Result<bool> {
     for ask in 0..ASKS {
         if ask > 0 {
             writeln!(output, "answer y or n")?;
@@ -30,7 +30,8 @@ pub fn confirm(input: &mut impl BufRead, output: &mut impl Write, question: &str
             return Ok(false);
         };
         match line.trim().to_ascii_lowercase().as_str() {
-            "" | "y" | "yes" => return Ok(true),
+            "" => return Ok(enter),
+            "y" | "yes" => return Ok(true),
             "n" | "no" => return Ok(false),
             _ => {}
         }
@@ -146,7 +147,7 @@ mod tests {
     /// The answer and what the prompt wrote for `typed`.
     fn answer(typed: &str) -> (bool, String) {
         let mut output = Vec::new();
-        let yes = confirm(&mut typed.as_bytes(), &mut output, QUESTION).unwrap();
+        let yes = confirm(&mut typed.as_bytes(), &mut output, QUESTION, true).unwrap();
         (yes, String::from_utf8(output).unwrap())
     }
 
@@ -162,6 +163,13 @@ mod tests {
         for typed in ["n\n", "N\n", "no\n", "No\n", "NO"] {
             assert_eq!(answer(typed), (false, QUESTION.to_owned()), "{typed:?}");
         }
+    }
+
+    #[test]
+    fn enter_can_mean_no() {
+        let mut output = Vec::new();
+        assert!(!confirm(&mut "\n".as_bytes(), &mut output, QUESTION, false).unwrap());
+        assert!(confirm(&mut "y\n".as_bytes(), &mut output, QUESTION, false).unwrap());
     }
 
     #[test]
@@ -187,7 +195,7 @@ mod tests {
     #[test]
     fn an_answer_that_is_not_utf8_asks_again() {
         let mut output = Vec::new();
-        let yes = confirm(&mut &b"\xff\xfe\ny\n"[..], &mut output, QUESTION).unwrap();
+        let yes = confirm(&mut &b"\xff\xfe\ny\n"[..], &mut output, QUESTION, true).unwrap();
         assert!(yes);
         assert_eq!(
             String::from_utf8(output).unwrap(),
