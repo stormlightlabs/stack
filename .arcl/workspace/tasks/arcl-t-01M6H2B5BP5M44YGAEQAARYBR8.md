@@ -2,10 +2,11 @@
 id = "arcl-t-01M6H2B5BP5M44YGAEQAARYBR8"
 parent = "arcl-t-01M6H2B5A7WXHN1S9S9W57BMV7"
 title = "Report drift with sltk check"
-status = "pending"
+status = "completed"
 priority = "normal"
 position = 0
 blocked-by = ["arcl-t-01M6H2B56F01QNVYY5C5K1CPPH"]
+evidence = "Done in #19 at d5a2292: sltk check reports drift in the pin, tools, fab files, arcl skills and glue; the train moves to fab 0.9.1"
 +++
 
 `fab check` covers only fabrial's files.

@@ -1,0 +1,13 @@
+
+# The commands fab run uses for each step of a tracked task. Each is
+# split on spaces and run in the task's worktree; {id}, {evidence}
+# and {file} are replaced. init, when set, runs once in the new
+# worktree before start. skill names the skill fab dispatch gives
+# an implementer.
+[tasks]
+init = "arcl init"
+skill = "arclightning"
+show = "arcl task show {id}"
+start = "arcl task start {id}"
+complete = "arcl task complete {id} --evidence {evidence}"
+handoff = "arcl task handoff {id} --note-file {file}"

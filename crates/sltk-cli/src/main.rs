@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use sltk_core::check;
 use sltk_core::doctor::{self, Machine, Note, Report};
 use sltk_core::host::{self, GitHub};
 use sltk_core::install::{self, HttpFetch, InstallError};
@@ -28,6 +29,10 @@ const PARTIAL: u8 = 4;
 /// The exit code of `sltk doctor` when it could not finish its checks, as
 /// when the pin cannot be read.
 const DOCTOR_ERROR: u8 = 2;
+
+/// The exit code of `sltk check` when a check could not run or finish, so
+/// drift may be missing from what it printed.
+const CHECK_ERROR: u8 = 2;
 
 /// The question `sltk install` asks on a terminal without `--yes`.
 const QUESTION: &str = "Install these? [Y/n] ";
@@ -81,30 +86,58 @@ enum Command {
     /// it will not read: a symlink, not a regular file, or over 64 KiB.
     ///
     /// Inside a git repository whose remote origin is on GitHub, it also
-    /// asks GitHub through `gh api` whether stormlight-thunderbot is
-    /// installed, THUNDERBOT_APP_ID and THUNDERBOT_PRIVATE_KEY are available
-    /// to the repository, and storm/review is required on main. Without gh
-    /// or a GitHub origin it skips these and says so. An answer gh could not
+    /// asks GitHub through `gh api` whether the App .github/fabrial.toml
+    /// names in `app` is installed, <PREFIX>_APP_ID and <PREFIX>_PRIVATE_KEY
+    /// are available to the repository, with the prefix from
+    /// `secret_prefix`, or THUNDERBOT when the file has none, and whether
+    /// storm/review is required on main. Without gh or a GitHub origin it
+    /// skips these and says so. Without .github/fabrial.toml or its `app`
+    /// it skips the App and secret checks and says so. An answer gh could not
     /// give, as when the token lacks a permission, is printed as "could not
     /// check" and is not a problem.
     ///
     /// Exits 0 when nothing is wrong, 1 when something is, and 2 when it
     /// could not check the tools, as when the pin cannot be read or parsed.
     Doctor,
+    /// Report where this repository has drifted from what sltk init sets up.
+    /// Changes nothing.
+    ///
+    /// Works in the repository root: --dir, or the top of the git repository
+    /// holding the current directory. It compares .github/sltk.toml with the
+    /// installed tools as sltk doctor does, and reports a missing pin or one
+    /// of another sltk release. It runs `fab check` and lists each line it
+    /// prints on drift, and `arcl skill install --check` and lists each skill
+    /// file it names. It compares the session hook, its SessionStart entry
+    /// in .claude/settings.json, the Tasks section and the [tasks] table in
+    /// .github/fabrial.toml with what sltk init writes when it adopts the
+    /// repository, each file on its own. It asks nothing, so it runs the
+    /// same off a terminal.
+    ///
+    /// Exits 0 when nothing differs, 1 when something does, and 2 when a
+    /// check could not run or finish, as when fab is not on PATH or sltk init
+    /// would refuse a glue file.
+    Check {
+        /// The repository root.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
     /// Set up this repository: run fab's and arcl's setup, write the session
     /// hook and the Tasks section, then write the pin.
     ///
-    /// Runs `fab init` with --owner, --trailer and --gates, then
-    /// `arcl init --workspace` and `arcl skill install`, in the repository
-    /// root: --dir, or the top of the git repository holding the current
-    /// directory. On a terminal it asks for each of the three settings left
-    /// out; off a terminal a missing one is an error. It stops at the first
+    /// Runs `fab init` with --owner, --app, --secret-prefix, --trailer and
+    /// --gates, then `arcl init --workspace` and `arcl skill install`, in
+    /// the repository root: --dir, or the top of the git repository holding
+    /// the current directory. On a terminal it asks for each of --owner,
+    /// --app, --trailer and --gates left out; off a terminal a missing one
+    /// is an error. --secret-prefix defaults to FABRIAL. It stops at the first
     /// command that fails and names the commands that ran and the ones that
     /// did not; rerunning with the same flags finishes the setup. When every
     /// command succeeds it writes the Tasks section into AGENTS.md between
     /// the sltk:tasks markers, .claude/hooks/session-start.sh, and the
     /// hook's SessionStart entry in .claude/settings.json, keeping the
-    /// file's other keys and hooks. It refuses, before writing any of them,
+    /// file's other keys and hooks, and, when .github/fabrial.toml has no
+    /// [tasks] table, appends one that runs arcl for each step of a tracked
+    /// task. It refuses, before writing any of them,
     /// a hook it did not write, a ## Tasks heading outside the markers, and
     /// a symlink in any of their paths. Then it writes .github/sltk.toml,
     /// pinning this sltk release and the sha256 of its archives, read from
@@ -119,15 +152,17 @@ enum Command {
     ///
     /// A repository with .github/fabrial.toml, no pin and no sltk-init
     /// record was set up by hand, and sltk init adopts it. It keeps the
-    /// settings in .github/fabrial.toml, so --owner, --trailer and --gates
-    /// are optional and must match the file when given. It needs fab and
-    /// arcl on PATH. It runs `fab check` and `arcl skill install --check`,
+    /// settings in .github/fabrial.toml, so each flag is optional and must
+    /// match the file when given. A file from fab 0.9.0 or earlier names no
+    /// app, and fab update needs one: then --app is required, asked for on
+    /// a terminal, and passed to fab update with --secret-prefix when
+    /// given. It needs fab and arcl on PATH. It runs `fab check` and `arcl skill install --check`,
     /// which write nothing, then prints the commands it will run, the files
     /// `fab check` reports that `fab update` will rewrite, and a diff of
     /// each file it writes: the session hook, which replaces any other, the
     /// Tasks section, which replaces a ## Tasks section outside the markers
     /// in place, the settings entry, which replaces the one SessionStart
-    /// entry that runs the hook, and the pin. The Tasks section goes in
+    /// entry that runs the hook, the [tasks] table, and the pin. The Tasks section goes in
     /// whichever of AGENTS.md and CLAUDE.md holds the sltk:tasks markers,
     /// else in AGENTS.md, or in CLAUDE.md when the repository has that and
     /// no AGENTS.md; a link from one to the other is followed. A ## Tasks
@@ -147,6 +182,15 @@ enum Command {
         /// GitHub login of the person who approves pull requests.
         #[arg(long)]
         owner: Option<String>,
+        /// The slug of the GitHub App the workflows act as: my-bot for
+        /// github.com/apps/my-bot.
+        #[arg(long)]
+        app: Option<String>,
+        /// The prefix of the secrets holding the App's ID and key: the
+        /// workflows read <PREFIX>_APP_ID and <PREFIX>_PRIVATE_KEY. A fresh
+        /// setup without it uses FABRIAL.
+        #[arg(long, value_name = "PREFIX")]
+        secret_prefix: Option<String>,
         /// The squash commit's Co-authored-by value, as "Name <email>".
         #[arg(long)]
         trailer: Option<String>,
@@ -208,8 +252,9 @@ fn main() -> ExitCode {
             )
         }
         Command::Doctor => run_doctor(&train),
-        Command::Init { owner, trailer, gates, with, dir, yes } => {
-            let flags = init::Flags { owner, trailer, gates, with, dir, yes };
+        Command::Check { dir } => run_check(&train, dir.as_deref()),
+        Command::Init { owner, app, secret_prefix, trailer, gates, with, dir, yes } => {
+            let flags = init::Flags { owner, app, secret_prefix, trailer, gates, with, dir, yes };
             let (mut input, mut output) = (io::stdin().lock(), io::stdout().lock());
             init::run(&train, &flags, on_terminal(), &mut input, &mut output)
         }
@@ -318,9 +363,15 @@ fn run_doctor(train: &Train) -> Result<u8, (u8, String)> {
     };
     let mut report = doctor::check(train, pin.as_ref(), sltk_core::VERSION, &machine);
     if let Some(root) = doctor::find_repo_root(&cwd) {
+        let app = doctor::read_app(root);
         match GitHub::detect(root, machine.path.as_deref(), host::HOST_TIMEOUT, host::HOST_DEADLINE) {
-            Ok(github) => doctor::check_repository(&github, &mut report),
-            Err(reason) => report.notes.push(Note::Skipped { reason }),
+            Ok(github) => doctor::check_repository(&github, app.as_ref(), &mut report),
+            Err(reason) => {
+                report
+                    .findings
+                    .extend(app.err().iter().flat_map(doctor::NoApp::findings));
+                report.notes.push(Note::Skipped { reason });
+            }
         }
     }
     print!("{}", doctor_report(&report, &machine));
@@ -348,6 +399,42 @@ fn doctor_report(report: &Report, machine: &Machine) -> String {
         report.checked.join(", "),
         machine.bin.display()
     ));
+    out
+}
+
+/// Runs `sltk check` on the repository at `dir`, or the one the current
+/// directory is in. Returns the exit code, or the exit code and the error to
+/// print.
+fn run_check(train: &Train, dir: Option<&std::path::Path>) -> Result<u8, (u8, String)> {
+    let root = init::repository_root(dir).map_err(|err| (CHECK_ERROR, err))?;
+    let machine = Machine::from_env().map_err(|err| (CHECK_ERROR, format!("{err}\n")))?;
+    let report = check::check(train, sltk_core::VERSION, &root, &machine);
+    print!("{}", check_report(&report, &root));
+    Ok(if !report.errors.is_empty() {
+        CHECK_ERROR
+    } else if !report.drift.is_empty() {
+        FAILED
+    } else {
+        0
+    })
+}
+
+/// What `sltk check` prints: one line per difference, one per check that
+/// could not run or finish, then a line counting both.
+fn check_report(report: &check::Report, root: &std::path::Path) -> String {
+    let mut out: String = report.drift.iter().map(|drift| format!("{drift}\n")).collect();
+    out.extend(report.errors.iter().map(|error| format!("{error}\n")));
+    let drift = match report.drift.len() {
+        0 => "no drift".to_owned(),
+        1 => "1 difference".to_owned(),
+        n => format!("{n} differences"),
+    };
+    let errors = match report.errors.len() {
+        0 => String::new(),
+        1 => "; 1 check did not finish".to_owned(),
+        n => format!("; {n} checks did not finish"),
+    };
+    out.push_str(&format!("sltk check: checked {}: {drift}{errors}\n", root.display()));
     out
 }
 
@@ -394,8 +481,8 @@ mod tests {
     use sltk_core::doctor::{Finding, Machine, Note, Report};
 
     use super::{
-        Choices, Cli, DECLINED, DECLINED_LINE, FAILED, PARTIAL, QUESTION, doctor_report, install_exit_code,
-        install_report, optional_tools, pinned_set, run_install, should_install,
+        Choices, Cli, DECLINED, DECLINED_LINE, FAILED, PARTIAL, QUESTION, check_report, doctor_report,
+        install_exit_code, install_report, optional_tools, pinned_set, run_install, should_install,
     };
 
     /// A train like the real one with mire listed: fab and arcl essential,
@@ -719,17 +806,14 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
         };
         let report = Report {
             checked: vec!["fab".into(), "arcl".into()],
-            findings: vec![Finding::SecretMissing { name: "THUNDERBOT_APP_ID".into() }],
+            findings: vec![Finding::SecretMissing { name: "FABRIAL_APP_ID".into() }],
             repository: Some("o/r on GitHub".into()),
-            notes: vec![Note::CouldNotCheck {
-                what: "secret THUNDERBOT_PRIVATE_KEY".into(),
-                reason: "HTTP 403".into(),
-            }],
+            notes: vec![Note::CouldNotCheck { what: "secret FABRIAL_PRIVATE_KEY".into(), reason: "HTTP 403".into() }],
         };
         assert_eq!(
             doctor_report(&report, &machine),
-            "secret THUNDERBOT_APP_ID is not available to this repository\n\
-             could not check secret THUNDERBOT_PRIVATE_KEY: HTTP 403\n\
+            "secret FABRIAL_APP_ID is not available to this repository\n\
+             could not check secret FABRIAL_PRIVATE_KEY: HTTP 403\n\
              sltk doctor: checked fab, arcl in /h/.cargo/bin and o/r on GitHub: 1 problem\n"
         );
         let skipped = Report {
@@ -742,6 +826,32 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
             doctor_report(&skipped, &machine),
             "skipped repository checks: gh not found\n\
              sltk doctor: checked fab in /h/.cargo/bin: no problems\n"
+        );
+    }
+
+    #[test]
+    fn check_prints_each_difference_and_error_then_a_summary() {
+        use sltk_core::check::{Drift, Report};
+        let root = PathBuf::from("/r");
+        assert_eq!(
+            check_report(&Report::default(), &root),
+            "sltk check: checked /r: no drift\n"
+        );
+        let mut report = Report { drift: vec![Drift::NoPin], errors: Vec::new() };
+        assert_eq!(
+            check_report(&report, &root),
+            ".github/sltk.toml: missing; sltk init writes it\nsltk check: checked /r: 1 difference\n"
+        );
+        report.drift.push(Drift::Fab("differs: a.yml".into()));
+        report
+            .errors
+            .push("could not run fab check: it did not exit within 120 s".into());
+        assert_eq!(
+            check_report(&report, &root),
+            ".github/sltk.toml: missing; sltk init writes it\n\
+             fab check: differs: a.yml\n\
+             could not run fab check: it did not exit within 120 s\n\
+             sltk check: checked /r: 2 differences; 1 check did not finish\n"
         );
     }
 }

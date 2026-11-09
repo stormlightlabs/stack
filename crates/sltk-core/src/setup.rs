@@ -29,6 +29,14 @@ pub const RELEASE_HASH_URL: &str =
 /// Where `fab init` writes fab's settings, relative to the repository root.
 pub const FAB_SETTINGS: &str = ".github/fabrial.toml";
 
+/// The secret prefix `fab init` writes when `sltk init` is given none: the
+/// workflows then read `FABRIAL_APP_ID` and `FABRIAL_PRIVATE_KEY`.
+pub const DEFAULT_SECRET_PREFIX: &str = "FABRIAL";
+
+/// The secret prefix fab's workflows read when its settings name none, as
+/// an install from fab 0.9.0 or earlier does until `fab update` writes it.
+pub const LEGACY_SECRET_PREFIX: &str = "THUNDERBOT";
+
 /// The file in the repository's git directory where `init` records a run
 /// that has not written the pin yet, as `git rev-parse --git-path` names it.
 pub const RECORD: &str = "sltk-init";
@@ -37,7 +45,8 @@ pub const RECORD: &str = "sltk-init";
 /// adopts a repository with fab's settings only when git holds no record of
 /// an earlier fresh run, since that record means a fresh run is unfinished.
 const ADOPT: &str = "to adopt the repository with the settings it has, \
-     remove sltk-init from the git directory and rerun sltk init without --owner, --trailer and --gates";
+     remove sltk-init from the git directory and rerun sltk init without --owner, --app, --secret-prefix, \
+     --trailer and --gates";
 
 /// Why `init` refuses a repository that already has a pin.
 const PINNED: &str = "sltk init sets up a repository once and never replaces the pin";
@@ -58,6 +67,11 @@ const MAX_SETTINGS_FILE: u64 = 64 * 1024;
 pub enum Flag {
     /// `--owner`: the GitHub login of the person who approves pull requests.
     Owner,
+    /// `--app`: the slug of the GitHub App the workflows act as.
+    App,
+    /// `--secret-prefix`: the prefix of the secrets holding the App's ID and
+    /// key.
+    SecretPrefix,
     /// `--trailer`: the squash commit's Co-authored-by value, `Name <email>`.
     Trailer,
     /// `--gates`: the command agents run before pushing.
@@ -66,12 +80,19 @@ pub enum Flag {
 
 impl Flag {
     /// Every flag, in the order `fab init` takes them.
-    pub const ALL: [Flag; 3] = [Flag::Owner, Flag::Trailer, Flag::Gates];
+    pub const ALL: [Flag; 5] = [Flag::Owner, Flag::App, Flag::SecretPrefix, Flag::Trailer, Flag::Gates];
+
+    /// The flags `fab init` requires, which `sltk init` asks for on a
+    /// terminal. [`Flag::SecretPrefix`] has a default,
+    /// [`DEFAULT_SECRET_PREFIX`].
+    pub const REQUIRED: [Flag; 4] = [Flag::Owner, Flag::App, Flag::Trailer, Flag::Gates];
 
     /// The flag as typed, such as `--owner`.
     pub fn name(self) -> &'static str {
         match self {
             Flag::Owner => "--owner",
+            Flag::App => "--app",
+            Flag::SecretPrefix => "--secret-prefix",
             Flag::Trailer => "--trailer",
             Flag::Gates => "--gates",
         }
@@ -80,10 +101,11 @@ impl Flag {
     /// Checks a value for this flag, so a value `fab init` would refuse fails
     /// before any download or answer is spent on it.
     ///
-    /// fab's own rules come from fab 0.8.0's `Settings::validate` and
-    /// `is_login` in `crates/fab-core/src/settings.rs`: no value is empty or
-    /// holds a quote, a backslash or a line break, and the owner is a GitHub
-    /// login without the `@`. sltk adds that a value holds no control
+    /// fab's own rules come from fab 0.9.1's `Settings::validate`,
+    /// `is_login`, `is_app_slug` and `is_secret_prefix` in
+    /// `crates/fab-core/src/settings.rs`: no value is empty or holds a quote,
+    /// a backslash or a line break, the owner is a GitHub login without the
+    /// `@`, the App is a slug and the prefix can start a secret name. sltk adds that a value holds no control
     /// character and no space at either end, and that a trailer reads
     /// `Name <email>`, the form a Co-authored-by line takes.
     pub fn check(self, value: &str) -> Result<(), String> {
@@ -103,6 +125,16 @@ impl Flag {
             Flag::Owner if value.starts_with('@') => Err("is a login without the @".to_owned()),
             Flag::Owner if !is_login(value) => Err(
                 "is not a GitHub login: letters, digits and single hyphens, not at either end, up to 39 characters"
+                    .to_owned(),
+            ),
+            Flag::App if !is_app_slug(value) => Err(
+                "is not a GitHub App slug: lowercase letters, digits and hyphens, not at either end, up to 34 \
+                 characters"
+                    .to_owned(),
+            ),
+            Flag::SecretPrefix if !is_secret_prefix(value) => Err(
+                "is not a secret name prefix: uppercase letters, digits and underscores, not starting with a \
+                 digit or GITHUB_"
                     .to_owned(),
             ),
             Flag::Trailer if !is_trailer(value) => Err("is not Name <email>".to_owned()),
@@ -187,11 +219,16 @@ pub trait HashSource {
     fn sha256(&self, platform: Platform) -> Result<String, String>;
 }
 
-/// The three settings `fab init` requires, each checked by [`Flag::check`].
+/// The settings `sltk init` passes to `fab init`, each checked by
+/// [`Flag::check`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FabSettings {
     /// The GitHub login of the person who approves pull requests.
     pub owner: String,
+    /// The slug of the GitHub App the workflows act as.
+    pub app: String,
+    /// The prefix of the secrets holding the App's ID and key.
+    pub secret_prefix: String,
     /// The squash commit's Co-authored-by value, as `Name <email>`.
     pub trailer: String,
     /// The command agents run before pushing.
@@ -200,8 +237,10 @@ pub struct FabSettings {
 
 impl FabSettings {
     /// Checks each value and returns the settings.
-    pub fn new(owner: String, trailer: String, gates: String) -> Result<FabSettings, SetupError> {
-        let settings = FabSettings { owner, trailer, gates };
+    pub fn new(
+        owner: String, app: String, secret_prefix: String, trailer: String, gates: String,
+    ) -> Result<FabSettings, SetupError> {
+        let settings = FabSettings { owner, app, secret_prefix, trailer, gates };
         for flag in Flag::ALL {
             flag.check(settings.get(flag))
                 .map_err(|reason| SetupError::BadFlag { flag: flag.name(), reason })?;
@@ -213,6 +252,8 @@ impl FabSettings {
     pub fn get(&self, flag: Flag) -> &str {
         match flag {
             Flag::Owner => &self.owner,
+            Flag::App => &self.app,
+            Flag::SecretPrefix => &self.secret_prefix,
             Flag::Trailer => &self.trailer,
             Flag::Gates => &self.gates,
         }
@@ -291,6 +332,8 @@ impl HashSource for ReleaseHashes<'_> {
 #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
 struct Record {
     owner: String,
+    app: String,
+    secret_prefix: String,
     trailer: String,
     gates: String,
     fab: String,
@@ -301,6 +344,8 @@ impl Record {
     fn get(&self, flag: Flag) -> &str {
         match flag {
             Flag::Owner => &self.owner,
+            Flag::App => &self.app,
+            Flag::SecretPrefix => &self.secret_prefix,
             Flag::Trailer => &self.trailer,
             Flag::Gates => &self.gates,
         }
@@ -311,14 +356,15 @@ impl Record {
     fn render(&self) -> String {
         format!(
             "# sltk init passed these settings to fab init and has not written the pin yet.\n\
-             owner = \"{}\"\ntrailer = \"{}\"\ngates = \"{}\"\nfab = \"{}\"\n",
-            self.owner, self.trailer, self.gates, self.fab
+             owner = \"{}\"\napp = \"{}\"\nsecret_prefix = \"{}\"\ntrailer = \"{}\"\ngates = \"{}\"\n\
+             fab = \"{}\"\n",
+            self.owner, self.app, self.secret_prefix, self.trailer, self.gates, self.fab
         )
     }
 }
 
 /// The setup commands `init` runs, in train order: those of every essential
-/// tool and of each tool in `with`. `fab init` gets fab's three flags.
+/// tool and of each tool in `with`. `fab init` gets every [`Flag`].
 pub fn commands(train: &Train, settings: &FabSettings, with: &[String]) -> Vec<Vec<String>> {
     let mut commands = Vec::new();
     for tool in &train.tools {
@@ -360,6 +406,8 @@ pub fn init(train: &Train, version: &str, init: Init, output: &mut dyn Write) ->
         .map_or("", |tool| tool.version.as_str());
     let record = Record {
         owner: init.settings.owner.clone(),
+        app: init.settings.app.clone(),
+        secret_prefix: init.settings.secret_prefix.clone(),
         trailer: init.settings.trailer.clone(),
         gates: init.settings.gates.clone(),
         fab: fab_version.to_owned(),
@@ -499,7 +547,7 @@ fn is_fab_init(command: &[String]) -> bool {
 
 /// Whether fab is already installed in `root` by an earlier `init` that
 /// stopped before the pin: `false` when there is no [`FAB_SETTINGS`], `true`
-/// when it holds `record`'s owner, trailer and gates and `record`'s fab as
+/// when it holds `record`'s value for each [`Flag`] and `record`'s fab as
 /// its version, and the record at `record_path` matches `record` too, and an
 /// error otherwise. Reads the settings as fab does, as TOML.
 fn fab_installed(root: &Path, record_path: &Path, record: &Record) -> Result<bool, SetupError> {
@@ -507,6 +555,8 @@ fn fab_installed(root: &Path, record_path: &Path, record: &Record) -> Result<boo
     #[derive(serde::Deserialize)]
     struct Installed {
         owner: String,
+        app: Option<String>,
+        secret_prefix: Option<String>,
         trailer: String,
         gates: String,
         version: String,
@@ -519,12 +569,14 @@ fn fab_installed(root: &Path, record_path: &Path, record: &Record) -> Result<boo
     let installed: Installed = toml::from_str(&text)
         .map_err(|err| refuse(format!("could not be read as fab's settings: {}", err.message())))?;
     let differ: Vec<&str> = [
-        (Flag::Owner, installed.owner),
-        (Flag::Trailer, installed.trailer),
-        (Flag::Gates, installed.gates),
+        (Flag::Owner, Some(installed.owner)),
+        (Flag::App, installed.app),
+        (Flag::SecretPrefix, installed.secret_prefix),
+        (Flag::Trailer, Some(installed.trailer)),
+        (Flag::Gates, Some(installed.gates)),
     ]
     .into_iter()
-    .filter(|(flag, value)| record.get(*flag) != value)
+    .filter(|(flag, value)| value.as_deref() != Some(record.get(*flag)))
     .map(|(flag, _)| flag.name())
     .collect();
     if !differ.is_empty() {
@@ -622,7 +674,7 @@ fn parse_digest(text: &str) -> Option<String> {
 
 /// Whether `owner` is a GitHub login: ASCII letters, digits and single
 /// hyphens, not starting or ending with a hyphen, up to 39 characters. A copy
-/// of `is_login` in fab 0.8.0's `crates/fab-core/src/settings.rs`.
+/// of `is_login` in fab 0.9.1's `crates/fab-core/src/settings.rs`.
 fn is_login(owner: &str) -> bool {
     !owner.is_empty()
         && owner.len() <= 39
@@ -630,6 +682,33 @@ fn is_login(owner: &str) -> bool {
         && !owner.starts_with('-')
         && !owner.ends_with('-')
         && !owner.contains("--")
+}
+
+/// Whether `app` is a GitHub App slug: lowercase ASCII letters, digits and
+/// hyphens, not starting or ending with a hyphen, up to 34 characters. A copy
+/// of `is_app_slug` in fab 0.9.1's `crates/fab-core/src/settings.rs`.
+fn is_app_slug(app: &str) -> bool {
+    !app.is_empty()
+        && app.len() <= 34
+        && app
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !app.starts_with('-')
+        && !app.ends_with('-')
+}
+
+/// Whether `prefix` can start a secret name GitHub accepts: uppercase ASCII
+/// letters, digits and underscores, not starting with a digit or `GITHUB_`.
+/// A copy of `is_secret_prefix` in fab 0.9.1's
+/// `crates/fab-core/src/settings.rs`.
+fn is_secret_prefix(prefix: &str) -> bool {
+    !prefix.is_empty()
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        && !prefix.starts_with(|c: char| c.is_ascii_digit())
+        && prefix != "GITHUB"
+        && !prefix.starts_with("GITHUB_")
 }
 
 /// Whether `value` reads `Name <email>`: a name, a space, and an address with
@@ -718,10 +797,42 @@ mod tests {
     fn settings() -> FabSettings {
         FabSettings::new(
             "octo".into(),
+            "octo-bot".into(),
+            "OCTO".into(),
             "Ada Lovelace <ada@example.com>".into(),
             "just check".into(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn an_app_must_be_a_slug_and_a_prefix_must_start_a_secret_name() {
+        let long = "x".repeat(34);
+        for good in ["stormlight-thunderbot", "a", "bot2", long.as_str()] {
+            assert_eq!(Flag::App.check(good), Ok(()), "{good}");
+        }
+        let longer = "x".repeat(35);
+        for bad in ["Bot", "-bot", "bot-", "my_bot", "bot[bot]", longer.as_str()] {
+            assert!(
+                Flag::App
+                    .check(bad)
+                    .unwrap_err()
+                    .starts_with("is not a GitHub App slug"),
+                "{bad}"
+            );
+        }
+        for good in ["FABRIAL", "THUNDERBOT", "MY_BOT2", "_X", "GITHUBX"] {
+            assert_eq!(Flag::SecretPrefix.check(good), Ok(()), "{good}");
+        }
+        for bad in ["fabrial", "2BOT", "GITHUB", "GITHUB_BOT", "MY-BOT"] {
+            assert!(
+                Flag::SecretPrefix
+                    .check(bad)
+                    .unwrap_err()
+                    .starts_with("is not a secret name prefix"),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
@@ -785,7 +896,14 @@ mod tests {
 
     #[test]
     fn a_bad_setting_names_its_flag() {
-        let err = FabSettings::new("octo".into(), "nobody".into(), "just check".into()).unwrap_err();
+        let err = FabSettings::new(
+            "octo".into(),
+            "octo-bot".into(),
+            "OCTO".into(),
+            "nobody".into(),
+            "just check".into(),
+        )
+        .unwrap_err();
         assert_eq!(err.to_string(), "sltk: --trailer is not Name <email>");
     }
 
@@ -812,7 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn fab_init_gets_the_three_flags_and_arcl_its_own_commands() {
+    fn fab_init_gets_every_flag_and_arcl_its_own_commands() {
         let train = Train::embedded().unwrap();
         let got = commands(&train, &settings(), &[]);
         let want: Vec<Vec<String>> = [
@@ -821,6 +939,10 @@ mod tests {
                 "init",
                 "--owner",
                 "octo",
+                "--app",
+                "octo-bot",
+                "--secret-prefix",
+                "OCTO",
                 "--trailer",
                 "Ada Lovelace <ada@example.com>",
                 "--gates",

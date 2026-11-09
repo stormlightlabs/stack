@@ -8,7 +8,7 @@ use std::process::Command;
 
 use sltk_core::adopt::{self, Adopt};
 use sltk_core::install::HttpFetch;
-use sltk_core::setup::{self, FabSettings, Flag, Init, ReleaseHashes};
+use sltk_core::setup::{self, DEFAULT_SECRET_PREFIX, FabSettings, Flag, Init, ReleaseHashes};
 use sltk_core::train::Train;
 
 use crate::{DECLINED, FAILED, prompt};
@@ -31,6 +31,10 @@ const NOT_A_REPOSITORY: &str =
 pub struct Flags {
     /// `--owner`, if given.
     pub owner: Option<String>,
+    /// `--app`, if given.
+    pub app: Option<String>,
+    /// `--secret-prefix`, if given.
+    pub secret_prefix: Option<String>,
     /// `--trailer`, if given.
     pub trailer: Option<String>,
     /// `--gates`, if given.
@@ -48,6 +52,8 @@ impl Flags {
     fn get(&self, flag: Flag) -> Option<&str> {
         match flag {
             Flag::Owner => self.owner.as_deref(),
+            Flag::App => self.app.as_deref(),
+            Flag::SecretPrefix => self.secret_prefix.as_deref(),
             Flag::Trailer => self.trailer.as_deref(),
             Flag::Gates => self.gates.as_deref(),
         }
@@ -55,8 +61,9 @@ impl Flags {
 }
 
 /// Runs `sltk init` in the repository root. Adopts a repository set up by
-/// hand, or else asks on a `terminal` for each fab setting the flags left
-/// out. Returns the exit code, or the exit code and the error to print.
+/// hand, asking on a `terminal` for `--app` when its settings name no App,
+/// or else asks on a `terminal` for each required fab setting the flags
+/// left out. Returns the exit code, or the exit code and the error to print.
 pub fn run(
     train: &Train, flags: &Flags, terminal: bool, input: &mut impl BufRead, output: &mut impl Write,
 ) -> Result<u8, (u8, String)> {
@@ -64,10 +71,20 @@ pub fn run(
     let fetch = HttpFetch::new();
     let hashes = ReleaseHashes { version: sltk_core::VERSION, fetch: &fetch };
     if adopt::adopting(&root).map_err(|err| (FAILED, format!("{err}\n")))? {
-        let given: Vec<(Flag, String)> = Flag::ALL
+        let mut given: Vec<(Flag, String)> = Flag::ALL
             .into_iter()
             .filter_map(|flag| flags.get(flag).map(|value| (flag, value.to_owned())))
             .collect();
+        for (flag, value) in &given {
+            flag.check(value)
+                .map_err(|reason| (FAILED, format!("sltk: {} {reason}\n", flag.name())))?;
+        }
+        if flags.app.is_none() && adopt::needs_app(&root).map_err(|err| (FAILED, format!("{err}\n")))? {
+            given.push((
+                Flag::App,
+                adoption_app(terminal, input, output).map_err(|err| (FAILED, err))?,
+            ));
+        }
         let adopt = Adopt { root: &root, given: &given, with: &flags.with, hashes: &hashes, path: None };
         return run_adopt(train, &adopt, flags.yes, terminal, input, output);
     }
@@ -101,13 +118,28 @@ fn run_adopt(
     Ok(0)
 }
 
-/// The fab settings from `flags`, asking for each missing one on a
+/// The `--app` adoption passes to `fab update` for settings that name no
+/// App, asked for on a `terminal`. Off a terminal it is an error.
+fn adoption_app(terminal: bool, input: &mut impl BufRead, output: &mut impl Write) -> Result<String, String> {
+    if !terminal {
+        return Err(format!(
+            "sltk: {} names no app, and fab update needs one; pass --app with the slug of the \
+             repository's GitHub App\n",
+            setup::FAB_SETTINGS
+        ));
+    }
+    prompt::ask(input, output, question(Flag::App), |answer| Flag::App.check(answer))
+        .map_err(|err| format!("sltk: could not ask for --app: {err}\n"))?
+        .ok_or_else(|| "sltk: no answer for --app\n".to_owned())
+}
+
+/// The fab settings from `flags`, asking for each missing required one on a
 /// `terminal`. Off a terminal a missing setting is an error that names each
-/// missing flag.
+/// missing flag. A missing `--secret-prefix` is [`DEFAULT_SECRET_PREFIX`].
 fn settings(
     flags: &Flags, terminal: bool, input: &mut impl BufRead, output: &mut impl Write,
 ) -> Result<FabSettings, String> {
-    let missing: Vec<&str> = Flag::ALL
+    let missing: Vec<&str> = Flag::REQUIRED
         .into_iter()
         .filter(|flag| flags.get(*flag).is_none())
         .map(Flag::name)
@@ -122,20 +154,23 @@ fn settings(
     for flag in Flag::ALL {
         let value = match flags.get(flag) {
             Some(value) => value.to_owned(),
+            None if flag == Flag::SecretPrefix => DEFAULT_SECRET_PREFIX.to_owned(),
             None => prompt::ask(input, output, question(flag), |answer| flag.check(answer))
                 .map_err(|err| format!("sltk: could not ask for {}: {err}\n", flag.name()))?
                 .ok_or_else(|| format!("sltk: no answer for {}\n", flag.name()))?,
         };
         values.push(value);
     }
-    let [owner, trailer, gates] = <[String; 3]>::try_from(values).expect("one value per flag");
-    FabSettings::new(owner, trailer, gates).map_err(|err| format!("{err}\n"))
+    let [owner, app, secret_prefix, trailer, gates] = <[String; 5]>::try_from(values).expect("one value per flag");
+    FabSettings::new(owner, app, secret_prefix, trailer, gates).map_err(|err| format!("{err}\n"))
 }
 
 /// What `sltk init` asks for `flag` on a terminal.
 fn question(flag: Flag) -> &'static str {
     match flag {
         Flag::Owner => "GitHub login of the person who approves pull requests (--owner): ",
+        Flag::App => "Slug of the GitHub App the workflows act as, from github.com/apps/<slug> (--app): ",
+        Flag::SecretPrefix => "Prefix of the secrets holding the App's ID and key (--secret-prefix): ",
         Flag::Trailer => "Co-authored-by trailer for squash commits, as Name <email> (--trailer): ",
         Flag::Gates => "Command agents run before pushing (--gates): ",
     }
@@ -143,7 +178,7 @@ fn question(flag: Flag) -> &'static str {
 
 /// `dir` when given, else the top of the git repository holding the current
 /// directory.
-fn repository_root(dir: Option<&Path>) -> Result<PathBuf, String> {
+pub fn repository_root(dir: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(dir) = dir {
         if !dir.is_dir() {
             return Err(format!("sltk: --dir {} is not a directory\n", dir.display()));
@@ -183,6 +218,8 @@ mod tests {
     fn flags(owner: Option<&str>, trailer: Option<&str>, gates: Option<&str>) -> Flags {
         Flags {
             owner: owner.map(String::from),
+            app: Some("octo-bot".to_owned()),
+            secret_prefix: None,
             trailer: trailer.map(String::from),
             gates: gates.map(String::from),
             with: Vec::new(),
@@ -299,7 +336,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".claude/hooks")).unwrap();
         std::fs::create_dir_all(root.join(".arcl")).unwrap();
         std::fs::create_dir_all(&bin).unwrap();
-        let settings = "owner = \"octo\"\ntrailer = \"Ada <ada@example.com>\"\ngates = \"make\"\n";
+        let settings = "owner = \"octo\"\napp = \"octo-bot\"\ntrailer = \"Ada <ada@example.com>\"\ngates = \"make\"\n";
         std::fs::write(root.join(FAB_SETTINGS), settings).unwrap();
         std::fs::write(root.join("AGENTS.md"), "# A\n\n## Tasks\n\nold\n").unwrap();
         std::fs::write(

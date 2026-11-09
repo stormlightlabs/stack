@@ -1,5 +1,6 @@
 //! The glue `sltk init` writes itself: the Tasks section in AGENTS.md, the
-//! session hook, and the hook's entry in `.claude/settings.json`.
+//! session hook, the hook's entry in `.claude/settings.json`, and the
+//! `[tasks]` table in fab's settings that points `fab run` at arcl.
 //!
 //! [`plan`] reads the files and works out each change; [`apply`] writes
 //! them. Each writer leaves a file alone when it already holds what it would
@@ -15,6 +16,8 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+use crate::setup::FAB_SETTINGS;
 
 /// Where the Tasks section goes, relative to the repository root.
 pub const AGENTS: &str = "AGENTS.md";
@@ -49,6 +52,12 @@ pub const TASKS: &str = include_str!("../templates/tasks.md");
 /// `.claude/settings.json` for a repository that has none. Its one
 /// SessionStart entry is the one [`settings`] adds to an existing file.
 pub const SETTINGS_TEMPLATE: &str = include_str!("../templates/settings.json");
+
+/// The `[tasks]` table [`fab_tasks`] adds to fab's settings: arcl's command
+/// for each step of a tracked task, with a blank line and fab's comment
+/// before it. The text is what fab 0.9.1 renders for these values, so `fab
+/// check` finds no drift in the file and `fab update` keeps the table.
+pub const FAB_TASKS: &str = include_str!("../templates/fab-tasks.toml");
 
 /// The mode the hook is written with.
 const HOOK_MODE: u32 = 0o755;
@@ -116,49 +125,37 @@ struct Line<'a> {
     fenced: bool,
 }
 
-/// Writes the Tasks section, the hook and its settings entry under `root`,
-/// and returns the paths, relative to `root`, of the files it changed.
+/// Writes the Tasks section, the hook, its settings entry and fab's `[tasks]`
+/// table under `root`, and returns the paths, relative to `root`, of the
+/// files it changed.
 ///
 /// Refuses a hook that differs from [`HOOK_SCRIPT`] rather than replace it.
-/// It checks all three files before writing any.
+/// It checks every file before writing any.
 pub fn write(root: &Path) -> Result<Vec<&'static str>, GlueError> {
     apply(root, &plan(root, Existing::Refuse)?)
 }
 
 /// The changes the glue writers would make under `root`, without writing
 /// anything. `existing` says what to do with a hook or a Tasks section sltk
-/// did not write.
+/// did not write. Fails with the first file [`plan_each`] could not plan.
 pub fn plan(root: &Path, existing: Existing) -> Result<Vec<Change>, GlueError> {
-    let content = |relative: &str| {
-        let path = root.join(relative);
-        move |reason| GlueError::Content { path, reason }
-    };
-    let target = tasks_file(root)?;
-    let agents = read(root, target)?;
-    let agents_text = tasks_section_with(agents.as_deref(), existing).map_err(content(target))?;
-    let hook = read(root, HOOK)?;
-    if existing == Existing::Refuse && hook.as_deref().is_some_and(|text| text != HOOK_SCRIPT) {
-        return Err(content(HOOK)(
-            "differs from the hook sltk writes, and sltk init replaces a hook only when it adopts a \
-             repository that has .github/fabrial.toml. Move this one aside and rerun sltk init"
-                .to_owned(),
-        ));
-    }
-    let settings_text = read(root, SETTINGS)?;
-    let merged = settings(settings_text.as_deref()).map_err(content(SETTINGS))?;
+    plan_each(root, existing)
+        .into_iter()
+        .filter_map(Result::transpose)
+        .collect()
+}
 
-    let mut changes = Vec::new();
-    if agents.as_deref() != Some(agents_text.as_str()) {
-        changes.push(Change { path: target, old: agents, new: agents_text, old_mode: None, mode: None });
-    }
-    let old_mode = hook.as_ref().and_then(|_| mode_of(&root.join(HOOK)));
-    if hook.as_deref() != Some(HOOK_SCRIPT) || !old_mode.is_none_or(|mode| mode & 0o111 == 0o111) {
-        changes.push(Change { path: HOOK, old: hook, new: HOOK_SCRIPT.to_owned(), old_mode, mode: Some(HOOK_MODE) });
-    }
-    if let Some(text) = merged {
-        changes.push(Change { path: SETTINGS, old: settings_text, new: text, old_mode: None, mode: None });
-    }
-    Ok(changes)
+/// Plans each glue file on its own, so one that cannot be planned does not
+/// hide the others: the Tasks file, the hook, the settings and fab's
+/// settings, in that order. Each gives the change [`plan`] would make,
+/// `None` when the file already matches, or why it cannot be planned.
+pub fn plan_each(root: &Path, existing: Existing) -> Vec<Result<Option<Change>, GlueError>> {
+    vec![
+        plan_tasks(root, existing),
+        plan_hook(root, existing),
+        plan_settings(root),
+        plan_fab(root),
+    ]
 }
 
 /// Writes each change under `root`, and returns the paths it wrote.
@@ -345,6 +342,70 @@ pub fn settings(existing: Option<&str>) -> Result<Option<String>, String> {
     let mut out = serde_json::to_string_pretty(&root).expect("a JSON value serializes");
     out.push('\n');
     Ok(Some(out))
+}
+
+/// fab's settings with [`FAB_TASKS`] appended, or `None` when there is no
+/// file, which `fab init` writes, or the file already has a `tasks` key. A
+/// table someone wrote stays as it is. The table goes at the end, where fab
+/// renders it, so appending it keeps every other key outside it. Fails when
+/// the file is not TOML.
+pub fn fab_tasks(existing: Option<&str>) -> Result<Option<String>, String> {
+    let Some(text) = existing else {
+        return Ok(None);
+    };
+    let table: toml::Table =
+        toml::from_str(text).map_err(|err| format!("could not be read as TOML: {}", err.message()))?;
+    if table.contains_key("tasks") {
+        return Ok(None);
+    }
+    let gap = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
+    Ok(Some(format!("{text}{gap}{FAB_TASKS}")))
+}
+
+/// Turns a reason into the [`GlueError::Content`] naming the file at
+/// `relative` under `root`, for `map_err`.
+fn content(root: &Path, relative: &str) -> impl FnOnce(String) -> GlueError {
+    let path = root.join(relative);
+    move |reason| GlueError::Content { path, reason }
+}
+
+/// The Tasks section's change, in the file [`tasks_file`] picks.
+fn plan_tasks(root: &Path, existing: Existing) -> Result<Option<Change>, GlueError> {
+    let target = tasks_file(root)?;
+    let old = read(root, target)?;
+    let new = tasks_section_with(old.as_deref(), existing).map_err(content(root, target))?;
+    let same = old.as_deref() == Some(new.as_str());
+    Ok((!same).then_some(Change { path: target, old, new, old_mode: None, mode: None }))
+}
+
+/// The hook's change, when its text or mode differs. With
+/// [`Existing::Refuse`], a hook sltk did not write is an error.
+fn plan_hook(root: &Path, existing: Existing) -> Result<Option<Change>, GlueError> {
+    let old = read(root, HOOK)?;
+    if existing == Existing::Refuse && old.as_deref().is_some_and(|text| text != HOOK_SCRIPT) {
+        return Err(content(root, HOOK)(
+            "differs from the hook sltk writes, and sltk init replaces a hook only when it adopts a \
+             repository that has .github/fabrial.toml. Move this one aside and rerun sltk init"
+                .to_owned(),
+        ));
+    }
+    let old_mode = old.as_ref().and_then(|_| mode_of(&root.join(HOOK)));
+    let same = old.as_deref() == Some(HOOK_SCRIPT) && old_mode.is_none_or(|mode| mode & 0o111 == 0o111);
+    Ok((!same).then(|| Change { path: HOOK, old, new: HOOK_SCRIPT.to_owned(), old_mode, mode: Some(HOOK_MODE) }))
+}
+
+/// The SessionStart entry's change to [`SETTINGS`].
+fn plan_settings(root: &Path) -> Result<Option<Change>, GlueError> {
+    let old = read(root, SETTINGS)?;
+    let new = settings(old.as_deref()).map_err(content(root, SETTINGS))?;
+    Ok(new.map(|new| Change { path: SETTINGS, old, new, old_mode: None, mode: None }))
+}
+
+/// The `[tasks]` table's change to [`FAB_SETTINGS`].
+fn plan_fab(root: &Path) -> Result<Option<Change>, GlueError> {
+    let old = read(root, FAB_SETTINGS)?;
+    let new = fab_tasks(old.as_deref()).map_err(content(root, FAB_SETTINGS))?;
+    Ok(new.map(|new| Change { path: FAB_SETTINGS, old, new, old_mode: None, mode: None }))
 }
 
 /// The byte offsets of the lines outside code fences that are a `## Tasks`
@@ -628,9 +689,34 @@ fn kind_or_link(path: &Path) -> Result<bool, GlueError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENTS, CLAUDE, Existing, HOOK_COMMAND, SETTINGS_TEMPLATE, TASKS, TASKS_BEGIN, TASKS_END, settings, tasks_file,
-        tasks_section, tasks_section_with,
+        AGENTS, CLAUDE, Existing, FAB_TASKS, HOOK_COMMAND, SETTINGS_TEMPLATE, TASKS, TASKS_BEGIN, TASKS_END, fab_tasks,
+        settings, tasks_file, tasks_section, tasks_section_with,
     };
+
+    #[test]
+    fn fab_settings_without_tasks_get_arcls_table_at_the_end() {
+        let text = "owner = \"octo\"\nplanning = [\".arcl/workspace/\"]\nversion = \"0.9.1\"\n";
+        let got = fab_tasks(Some(text)).unwrap().unwrap();
+        assert_eq!(got, format!("{text}{FAB_TASKS}"));
+        let table: toml::Table = toml::from_str(&got).unwrap();
+        assert_eq!(table["tasks"]["start"].as_str(), Some("arcl task start {id}"));
+        assert_eq!(table["tasks"]["skill"].as_str(), Some("arclightning"));
+        assert_eq!(table["owner"].as_str(), Some("octo"));
+        assert_eq!(fab_tasks(Some(&got)).unwrap(), None);
+        assert_eq!(
+            fab_tasks(Some("version = \"0.9.1\"")).unwrap().unwrap(),
+            format!("version = \"0.9.1\"\n{FAB_TASKS}")
+        );
+    }
+
+    #[test]
+    fn fab_settings_with_their_own_tasks_or_none_at_all_are_left_alone() {
+        assert_eq!(fab_tasks(None).unwrap(), None);
+        let theirs = "owner = \"octo\"\n[tasks]\nshow = \"gh issue view {id}\"\n";
+        assert_eq!(fab_tasks(Some(theirs)).unwrap(), None);
+        let err = fab_tasks(Some("owner = ")).unwrap_err();
+        assert!(err.starts_with("could not be read as TOML"), "{err}");
+    }
 
     /// Settings whose one SessionStart group runs `commands`.
     fn settings_running(commands: &[&str]) -> String {
