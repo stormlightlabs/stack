@@ -14,10 +14,16 @@ use std::process::{Command, Output, Stdio};
 /// on `PATH`, and returns its output. Downloads go to a proxy that refuses
 /// connections.
 fn sltk_init(dir: &Path, args: &[&str]) -> Output {
+    sltk_init_in(dir, args, |_| {})
+}
+
+/// [`sltk_init`], with `prepare` run on the new repository first.
+fn sltk_init_in(dir: &Path, args: &[&str], prepare: impl FnOnce(&Path)) -> Output {
     let (repo, bin) = (dir.join("repo"), dir.join("bin"));
     std::fs::create_dir_all(&bin).unwrap();
     let status = Command::new("git").args(["init", "-q"]).arg(&repo).status().unwrap();
     assert!(status.success());
+    prepare(&repo);
     for tool in ["fab", "arcl"] {
         let script = bin.join(tool);
         std::fs::write(
@@ -87,4 +93,29 @@ fn without_release_hashes_nothing_runs_and_no_pin_is_written() {
     assert!(stderr.contains("publishes none before 0.1.0"), "{stderr}");
     assert!(!dir.path().join("calls").exists());
     assert!(!dir.path().join("repo/.github").exists());
+}
+
+/// A repository with fab's settings and no pin is adopted, so no flag is
+/// needed. Without release hashes the plan stops before any command or write.
+#[test]
+fn a_repository_set_up_by_hand_is_adopted_without_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings = "owner = \"octo\"\ntrailer = \"Ada <ada@example.com>\"\ngates = \"make\"\n";
+    let output = sltk_init_in(dir.path(), &[], |repo| {
+        std::fs::create_dir_all(repo.join(".github")).unwrap();
+        std::fs::write(repo.join(".github/fabrial.toml"), settings).unwrap();
+    });
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.starts_with("sltk: could not read the sha256 of the sltk "),
+        "{stderr}"
+    );
+    assert!(!dir.path().join("calls").exists());
+    let entries: Vec<_> = std::fs::read_dir(dir.path().join("repo/.github")).unwrap().collect();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("repo/.github/fabrial.toml")).unwrap(),
+        settings
+    );
 }

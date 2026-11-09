@@ -116,7 +116,33 @@ enum Command {
     /// .github/sltk.toml, or any .github/fabrial.toml but one an earlier run
     /// left: the record matches the flags, and the file holds the same
     /// settings and the train's fab version. Then it skips `fab init`.
-    /// Exits 0 when set up, 1 otherwise.
+    ///
+    /// A repository with .github/fabrial.toml, no pin and no sltk-init
+    /// record was set up by hand, and sltk init adopts it. It keeps the
+    /// settings in .github/fabrial.toml, so --owner, --trailer and --gates
+    /// are optional and must match the file when given. It needs fab and
+    /// arcl on PATH. It runs `fab check` and `arcl skill install --check`,
+    /// which write nothing, then prints the commands it will run, the files
+    /// `fab check` reports that `fab update` will rewrite, and a diff of
+    /// each file it writes: the session hook, which replaces any other, the
+    /// Tasks section, which replaces a ## Tasks section outside the markers
+    /// in place, the settings entry, which replaces the one SessionStart
+    /// entry that runs the hook, and the pin. The Tasks section goes in
+    /// whichever of AGENTS.md and CLAUDE.md holds the sltk:tasks markers,
+    /// else in AGENTS.md, or in CLAUDE.md when the repository has that and
+    /// no AGENTS.md; a link from one to the other is followed. A ## Tasks
+    /// section outside the markers ends at the next # or ## heading or HTML
+    /// comment line outside a code fence. It refuses another # or ## heading
+    /// that reads as Tasks, which it would leave beside its own section,
+    /// and a code fence that nothing closes. Without --yes it asks
+    /// before changing anything, and exits 3 without writing when the
+    /// answer is no, or off a terminal. With a yes it writes those files,
+    /// runs `fab update`, `arcl init --workspace` when there is no .arcl,
+    /// and `arcl skill install` when the check exited 4, then writes the
+    /// pin. A failure leaves no pin, and a rerun adopts again.
+    ///
+    /// Exits 0 when set up, 3 when adoption is declined or not confirmed,
+    /// and 1 on any other failure.
     Init {
         /// GitHub login of the person who approves pull requests.
         #[arg(long)]
@@ -133,6 +159,9 @@ enum Command {
         /// The repository root.
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// Adopt a repository set up by hand without asking.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -179,8 +208,8 @@ fn main() -> ExitCode {
             )
         }
         Command::Doctor => run_doctor(&train),
-        Command::Init { owner, trailer, gates, with, dir } => {
-            let flags = init::Flags { owner, trailer, gates, with, dir };
+        Command::Init { owner, trailer, gates, with, dir, yes } => {
+            let flags = init::Flags { owner, trailer, gates, with, dir, yes };
             let (mut input, mut output) = (io::stdin().lock(), io::stdout().lock());
             init::run(&train, &flags, on_terminal(), &mut input, &mut output)
         }
@@ -239,7 +268,7 @@ fn should_install(yes: bool, terminal: bool, input: &mut impl BufRead, output: &
     if yes || !terminal {
         return Ok(true);
     }
-    prompt::confirm(input, output, QUESTION)
+    prompt::confirm(input, output, QUESTION, true)
 }
 
 /// Runs `sltk install`: settles the tools with [`optional_tools`], writes the

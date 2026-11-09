@@ -1,15 +1,26 @@
-//! `sltk init`: gathers fab's settings from flags or questions, finds the
-//! repository root, and hands both to [`sltk_core::setup::init`].
+//! `sltk init`: finds the repository root, then adopts a repository set up
+//! by hand through [`sltk_core::adopt`], or gathers fab's settings from flags
+//! or questions and hands them to [`sltk_core::setup::init`].
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use sltk_core::adopt::{self, Adopt};
 use sltk_core::install::HttpFetch;
 use sltk_core::setup::{self, FabSettings, Flag, Init, ReleaseHashes};
 use sltk_core::train::Train;
 
-use crate::{FAILED, prompt};
+use crate::{DECLINED, FAILED, prompt};
+
+/// The question adoption asks on a terminal without `--yes`. Enter means no.
+const ADOPT_QUESTION: &str = "Adopt this repository? [y/N] ";
+
+/// The last line adoption prints when the person answers no.
+const NOT_ADOPTED: &str = "sltk: nothing was written\n";
+
+/// The error adoption prints off a terminal without `--yes`.
+const NO_TERMINAL: &str = "sltk: nothing was written; pass --yes to adopt the repository off a terminal\n";
 
 /// The error when no `--dir` is given and the current directory is not in a
 /// git repository.
@@ -28,6 +39,8 @@ pub struct Flags {
     pub with: Vec<String>,
     /// `--dir`, if given.
     pub dir: Option<PathBuf>,
+    /// `--yes`: adopt without asking.
+    pub yes: bool,
 }
 
 impl Flags {
@@ -41,18 +54,50 @@ impl Flags {
     }
 }
 
-/// Runs `sltk init` in the repository root, asking on a `terminal` for each
-/// fab setting the flags left out. Returns the exit code, or the exit code
-/// and the error to print.
+/// Runs `sltk init` in the repository root. Adopts a repository set up by
+/// hand, or else asks on a `terminal` for each fab setting the flags left
+/// out. Returns the exit code, or the exit code and the error to print.
 pub fn run(
     train: &Train, flags: &Flags, terminal: bool, input: &mut impl BufRead, output: &mut impl Write,
 ) -> Result<u8, (u8, String)> {
     let root = repository_root(flags.dir.as_deref()).map_err(|err| (FAILED, err))?;
-    let settings = settings(flags, terminal, input, output).map_err(|err| (FAILED, err))?;
     let fetch = HttpFetch::new();
     let hashes = ReleaseHashes { version: sltk_core::VERSION, fetch: &fetch };
+    if adopt::adopting(&root).map_err(|err| (FAILED, format!("{err}\n")))? {
+        let given: Vec<(Flag, String)> = Flag::ALL
+            .into_iter()
+            .filter_map(|flag| flags.get(flag).map(|value| (flag, value.to_owned())))
+            .collect();
+        let adopt = Adopt { root: &root, given: &given, with: &flags.with, hashes: &hashes, path: None };
+        return run_adopt(train, &adopt, flags.yes, terminal, input, output);
+    }
+    let settings = settings(flags, terminal, input, output).map_err(|err| (FAILED, err))?;
     let init = Init { root: &root, settings: &settings, with: &flags.with, hashes: &hashes, path: None };
     setup::init(train, sltk_core::VERSION, init, output).map_err(|err| (FAILED, format!("{err}\n")))?;
+    Ok(0)
+}
+
+/// Adopts the repository `adopt` names: plans the adoption and prints it,
+/// then carries it out with `yes`, or on a `terminal` when the person says
+/// yes. Off a terminal without `yes` it exits [`DECLINED`] without asking.
+/// Returns the exit code, or the exit code and the error to print.
+fn run_adopt(
+    train: &Train, adopt: &Adopt, yes: bool, terminal: bool, input: &mut impl BufRead, output: &mut impl Write,
+) -> Result<u8, (u8, String)> {
+    let failed = |err: setup::SetupError| (FAILED, format!("{err}\n"));
+    let io_failed = |err: std::io::Error| (FAILED, format!("sltk: could not ask before adopting: {err}\n"));
+    let adoption = adopt::plan(train, sltk_core::VERSION, adopt).map_err(failed)?;
+    output.write_all(adoption.describe().as_bytes()).map_err(io_failed)?;
+    if !yes {
+        if !terminal {
+            return Err((DECLINED, NO_TERMINAL.to_owned()));
+        }
+        if !prompt::confirm(input, output, ADOPT_QUESTION, false).map_err(io_failed)? {
+            output.write_all(NOT_ADOPTED.as_bytes()).map_err(io_failed)?;
+            return Ok(DECLINED);
+        }
+    }
+    adopt::apply(train, adopt, &adoption, output).map_err(failed)?;
     Ok(0)
 }
 
@@ -129,8 +174,11 @@ fn git_toplevel(cwd: Option<&Path>) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Flags, git_toplevel, question, settings};
-    use sltk_core::setup::Flag;
+    use super::{ADOPT_QUESTION, Flags, NO_TERMINAL, NOT_ADOPTED, git_toplevel, question, run_adopt, settings};
+    use crate::DECLINED;
+    use sltk_core::adopt::Adopt;
+    use sltk_core::setup::{FAB_SETTINGS, Flag, HashSource};
+    use sltk_core::train::{Platform, Train};
 
     fn flags(owner: Option<&str>, trailer: Option<&str>, gates: Option<&str>) -> Flags {
         Flags {
@@ -139,6 +187,7 @@ mod tests {
             gates: gates.map(String::from),
             with: Vec::new(),
             dir: None,
+            yes: false,
         }
     }
 
@@ -225,5 +274,125 @@ mod tests {
             .unwrap();
         assert!(status.success());
         assert_eq!(git_toplevel(Some(&repo)).unwrap(), repo.canonicalize().unwrap());
+    }
+
+    /// The same hash for every platform, in place of a published release.
+    #[cfg(unix)]
+    struct Fixed;
+
+    #[cfg(unix)]
+    impl HashSource for Fixed {
+        fn sha256(&self, _: Platform) -> Result<String, String> {
+            Ok("ab".repeat(32))
+        }
+    }
+
+    /// A repository set up by hand, with a hand-copied hook, and a bin
+    /// directory whose `fab` and `arcl` exit 0 and append each call to
+    /// `calls`.
+    #[cfg(unix)]
+    fn hand_set_up() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (root, bin) = (dir.path().join("repo"), dir.path().join("bin"));
+        std::fs::create_dir_all(root.join(".github")).unwrap();
+        std::fs::create_dir_all(root.join(".claude/hooks")).unwrap();
+        std::fs::create_dir_all(root.join(".arcl")).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let settings = "owner = \"octo\"\ntrailer = \"Ada <ada@example.com>\"\ngates = \"make\"\n";
+        std::fs::write(root.join(FAB_SETTINGS), settings).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "# A\n\n## Tasks\n\nold\n").unwrap();
+        std::fs::write(
+            root.join(".claude/hooks/session-start.sh"),
+            "#!/bin/sh\nversion=0.3.0\n",
+        )
+        .unwrap();
+        for tool in ["fab", "arcl"] {
+            let script = bin.join(tool);
+            let text = format!(
+                "#!/bin/sh\necho \"{tool} $*\" >> '{}'\n",
+                dir.path().join("calls").display()
+            );
+            std::fs::write(&script, text).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (dir, root, bin)
+    }
+
+    /// Each file under `root` with its bytes, in order.
+    #[cfg(unix)]
+    fn files(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            if path.is_dir() {
+                stack.extend(std::fs::read_dir(&path).unwrap().map(|entry| entry.unwrap().path()));
+            } else {
+                out.push((path.clone(), std::fs::read(&path).unwrap()));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Runs adoption on a repository set up by hand, with `yes`, `terminal`
+    /// and `typed` as the answer. Returns the result, what it wrote, and
+    /// whether the tree changed.
+    #[cfg(unix)]
+    fn adopt(yes: bool, terminal: bool, typed: &str) -> (Result<u8, (u8, String)>, String, bool) {
+        let (dir, root, bin) = hand_set_up();
+        let before = files(&root);
+        let path = std::ffi::OsString::from(&bin);
+        let adopt = Adopt { root: &root, given: &[], with: &[], hashes: &Fixed, path: Some(&path) };
+        let train = Train::embedded().unwrap();
+        let mut output = Vec::new();
+        let result = run_adopt(&train, &adopt, yes, terminal, &mut typed.as_bytes(), &mut output);
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+        if !yes && (result != Ok(0)) {
+            assert_eq!(calls, "fab check\narcl skill install --check\n");
+        }
+        (result, String::from_utf8(output).unwrap(), files(&root) != before)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn off_a_terminal_without_yes_adoption_prints_the_diff_and_writes_nothing() {
+        let (result, output, changed) = adopt(false, false, "y\n");
+        assert_eq!(result, Err((DECLINED, NO_TERMINAL.to_owned())));
+        assert!(output.contains("\n--- a/.claude/hooks/session-start.sh\n"), "{output}");
+        assert!(output.ends_with("\n+optional = []\n"), "{output}");
+        assert!(!changed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_a_terminal_no_or_enter_writes_nothing() {
+        for typed in ["n\n", "\n", ""] {
+            let (result, output, changed) = adopt(false, true, typed);
+            assert_eq!(result, Ok(DECLINED), "{typed:?}");
+            assert!(output.contains(ADOPT_QUESTION), "{output}");
+            assert!(output.ends_with(NOT_ADOPTED), "{output}");
+            assert!(!changed, "{typed:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn yes_at_the_prompt_or_as_a_flag_adopts() {
+        let (result, output, changed) = adopt(false, true, "y\n");
+        assert_eq!(result, Ok(0));
+        assert!(
+            output.contains(&format!("{ADOPT_QUESTION}wrote AGENTS.md\n")),
+            "{output}"
+        );
+        assert!(
+            output.ends_with("running fab update\nwrote .github/sltk.toml\n"),
+            "{output}"
+        );
+        assert!(changed);
+        let (result, output, changed) = adopt(true, false, "");
+        assert_eq!(result, Ok(0));
+        assert!(!output.contains(ADOPT_QUESTION), "{output}");
+        assert!(changed);
     }
 }

@@ -2,10 +2,11 @@
 id = "arcl-t-01M6H2B56F01QNVYY5C5K1CPPH"
 parent = "arcl-t-01M6H2B557EB9CNG08ACBRPG1P"
 title = "Adopt a set-up repository with a diff first"
-status = "pending"
+status = "completed"
 priority = "normal"
 position = 0
 blocked-by = ["arcl-t-01M6H2B54RPG8TH5XFD4SNAZR3"]
+evidence = "Done in #18 at 04c4f29: sltk init adopts a set-up repository, showing the glue diff and the files fab update will rewrite before writing"
 +++
 
 Five repositories already use fabrial, with

@@ -14,7 +14,7 @@
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Output, Stdio};
 
 use crate::glue::{self, GlueError};
 use crate::install::Fetch;
@@ -33,10 +33,14 @@ pub const FAB_SETTINGS: &str = ".github/fabrial.toml";
 /// that has not written the pin yet, as `git rev-parse --git-path` names it.
 pub const RECORD: &str = "sltk-init";
 
-/// Why `init` refuses a repository that something other than its own earlier
-/// run set up, and where that work is planned.
-const ADOPT: &str = "sltk cannot adopt a repository set up by hand yet \
-     (planned in the stack task \"Adopt repositories set up by hand\")";
+/// What to do about fab's settings that fresh setup refuses. `sltk init`
+/// adopts a repository with fab's settings only when git holds no record of
+/// an earlier fresh run, since that record means a fresh run is unfinished.
+const ADOPT: &str = "to adopt the repository with the settings it has, \
+     remove sltk-init from the git directory and rerun sltk init without --owner, --trailer and --gates";
+
+/// Why `init` refuses a repository that already has a pin.
+const PINNED: &str = "sltk init sets up a repository once and never replaces the pin";
 
 /// Why a download of a `.sha256` file can fail even when the network works.
 const UNPUBLISHED: &str =
@@ -110,9 +114,8 @@ impl Flag {
 /// Why `sltk init` stopped.
 #[derive(Debug, thiserror::Error)]
 pub enum SetupError {
-    /// The repository already has a pin. Adopting a set-up repository is not
-    /// built yet, and `init` never overwrites the pin.
-    #[error("sltk: {} already exists; {ADOPT}", path.display())]
+    /// The repository already has a pin, and `init` never overwrites it.
+    #[error("sltk: {} already exists; {PINNED}", path.display())]
     PinExists { path: PathBuf },
     /// The repository has fab's settings file, and it is not the one an
     /// earlier `sltk init` with the same flags wrote.
@@ -143,6 +146,23 @@ pub enum SetupError {
     /// be written.
     #[error(transparent)]
     Glue(#[from] GlueError),
+    /// Adoption could not use fab's settings: the file cannot be read, or a
+    /// flag given differs from it.
+    #[error("sltk: {} {reason}", path.display())]
+    Adopt { path: PathBuf, reason: String },
+    /// `arcl skill install --check` failed with a status other than the one
+    /// that means a skill file is missing or differs.
+    #[error("sltk: {command} failed with {status}; sltk changed nothing")]
+    Check { command: String, status: ExitStatus },
+    /// A program adoption runs is not on `PATH`.
+    #[error(
+        "sltk: {program} is not in an absolute PATH directory, and sltk init runs it to adopt this repository. \
+             Install it with sltk install and rerun sltk init; sltk changed nothing"
+    )]
+    NoProgram { program: String },
+    /// A file changed between the diff adoption showed and the write.
+    #[error("sltk: {} changed after sltk showed the diff; sltk changed nothing, so rerun sltk init", path.display())]
+    Changed { path: PathBuf },
     /// A setup command could not be started.
     #[error("sltk: could not run {command} in {}: {source}. {progress}", dir.display())]
     Spawn {
@@ -370,7 +390,6 @@ pub fn init(train: &Train, version: &str, init: Init, output: &mut dyn Write) ->
         path: record_path.clone(),
         reason: format!("could not be written: {err}"),
     })?;
-    let search = init.path.map(OsStr::to_owned).or_else(|| std::env::var_os("PATH"));
     let mut ran = Vec::new();
     for (i, command) in commands.iter().enumerate() {
         let line = &lines[i];
@@ -387,18 +406,7 @@ pub fn init(train: &Train, version: &str, init: Init, output: &mut dyn Write) ->
             source,
             progress: progress(),
         };
-        let program = find_program(&command[0], search.as_deref()).ok_or_else(|| {
-            spawn(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("no executable file named {} in an absolute PATH directory", command[0]),
-            ))
-        })?;
-        let mut process = Command::new(program);
-        process.args(&command[1..]).current_dir(init.root);
-        if let Some(path) = init.path {
-            process.env("PATH", path);
-        }
-        let status = process.status().map_err(spawn)?;
+        let status = run(command, init.root, init.path).map_err(spawn)?;
         if !status.success() {
             return Err(SetupError::Failed { command: line.clone(), status, progress: progress() });
         }
@@ -429,6 +437,22 @@ pub fn find_program(name: &str, path: Option<&OsStr>) -> Option<PathBuf> {
         .find(|candidate| is_executable(candidate))
 }
 
+/// Runs `command` in `root` and waits for it. The program is found with
+/// [`find_program`] on `path`, or on the `PATH` `sltk` runs with when `path`
+/// is `None`, and the command gets `path` as its `PATH` when given.
+pub fn run(command: &[String], root: &Path, path: Option<&OsStr>) -> std::io::Result<ExitStatus> {
+    prepare(command, root, path)?.status()
+}
+
+/// [`run`], with the command's standard output captured and returned with
+/// its status. Its standard error still goes to `sltk`'s.
+pub fn run_captured(command: &[String], root: &Path, path: Option<&OsStr>) -> std::io::Result<Output> {
+    prepare(command, root, path)?
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output()
+}
+
 /// A path git printed on its own line, from its raw bytes. On Unix any bytes
 /// make a path; elsewhere the path must be UTF-8.
 pub fn path_from_git(mut stdout: Vec<u8>) -> Result<PathBuf, String> {
@@ -449,6 +473,23 @@ pub fn path_from_git(mut stdout: Vec<u8>) -> Result<PathBuf, String> {
             .map(PathBuf::from)
             .map_err(|_| "git printed a path that is not UTF-8".to_owned())
     }
+}
+
+/// The process [`run`] and [`run_captured`] start, not yet started.
+fn prepare(command: &[String], root: &Path, path: Option<&OsStr>) -> std::io::Result<Command> {
+    let search = path.map(OsStr::to_owned).or_else(|| std::env::var_os("PATH"));
+    let program = find_program(&command[0], search.as_deref()).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no executable file named {} in an absolute PATH directory", command[0]),
+        )
+    })?;
+    let mut process = Command::new(program);
+    process.args(&command[1..]).current_dir(root);
+    if let Some(path) = path {
+        process.env("PATH", path);
+    }
+    Ok(process)
 }
 
 /// Whether `command` is the train's `fab init`.
@@ -510,7 +551,7 @@ fn fab_installed(root: &Path, record_path: &Path, record: &Record) -> Result<boo
 
 /// Where `init` records its run for `root`: [`RECORD`] in the git directory,
 /// as `git rev-parse --git-path` gives it, so a linked worktree gets its own.
-fn record_path(root: &Path) -> Result<PathBuf, SetupError> {
+pub(crate) fn record_path(root: &Path) -> Result<PathBuf, SetupError> {
     let fail = |reason: String| SetupError::NoGitDir { root: root.to_owned(), reason };
     let git = find_program("git", std::env::var_os("PATH").as_deref())
         .ok_or_else(|| fail("no executable file named git in an absolute PATH directory".to_owned()))?;
@@ -529,7 +570,7 @@ fn record_path(root: &Path) -> Result<PathBuf, SetupError> {
 /// The text of the regular file at `path`, or `None` when there is none.
 /// Refuses a symlink, anything but a regular file, and a file longer than
 /// [`MAX_SETTINGS_FILE`], with the reason as the error.
-fn read_small(path: &Path) -> Result<Option<String>, String> {
+pub(crate) fn read_small(path: &Path) -> Result<Option<String>, String> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -613,7 +654,7 @@ fn is_trailer(value: &str) -> bool {
 
 /// A command as a person would type it, with each argument that holds
 /// anything but letters, digits and `-_./=:@` in single quotes.
-fn command_line(command: &[String]) -> String {
+pub(crate) fn command_line(command: &[String]) -> String {
     let plain = |arg: &str| !arg.is_empty() && arg.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=:@".contains(c));
     command
         .iter()
