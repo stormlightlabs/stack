@@ -529,7 +529,10 @@ fn init_writes_the_tasks_section_and_the_hook_and_a_second_run_changes_nothing()
     let settings = std::fs::read_to_string(fakes.root.join(glue::SETTINGS)).unwrap();
     assert!(settings.starts_with("{\n  \"permissions\": {"), "{settings}");
     assert!(
-        settings.contains(&format!("\"command\": \"{}\"", glue::HOOK_COMMAND)),
+        settings.contains(&format!(
+            "\"command\": {}",
+            serde_json::to_string(glue::HOOK_COMMAND).unwrap()
+        )),
         "{settings}"
     );
 
@@ -573,4 +576,64 @@ fn a_linked_agents_file_is_refused() {
         "{err}"
     );
     assert!(!dir.path().join(".claude").exists());
+}
+
+#[test]
+fn a_hook_sltk_did_not_write_is_refused_and_nothing_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let hook = dir.path().join(glue::HOOK);
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook, "#!/bin/sh\necho mine\n").unwrap();
+    let err = glue::write(dir.path()).unwrap_err().to_string();
+    assert_eq!(
+        err,
+        format!(
+            "sltk: {}: differs from the hook sltk writes, and sltk does not replace it. Adopting an \
+             existing hook comes in a later release; until then, move this one aside and rerun sltk init",
+            hook.display()
+        )
+    );
+    assert_eq!(std::fs::read_to_string(&hook).unwrap(), "#!/bin/sh\necho mine\n");
+    assert!(!dir.path().join(glue::AGENTS).exists());
+    assert!(!dir.path().join(glue::SETTINGS).exists());
+}
+
+#[test]
+fn an_unmarked_tasks_section_is_refused_and_nothing_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let agents = dir.path().join(glue::AGENTS);
+    std::fs::write(&agents, "# AGENTS.md\n\n## Tasks\n\nOur rules.\n").unwrap();
+    let err = glue::write(dir.path()).unwrap_err().to_string();
+    assert!(err.contains("AGENTS.md: has a ## Tasks heading outside"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(&agents).unwrap(),
+        "# AGENTS.md\n\n## Tasks\n\nOur rules.\n"
+    );
+    assert!(!dir.path().join(".claude").exists());
+}
+
+#[test]
+fn a_linked_directory_above_a_glue_file_is_refused() {
+    for linked in [".claude", ".claude/hooks"] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = repo.join(linked);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let err = glue::write(&repo).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!("sltk: {} is a symlink, which sltk does not follow", link.display()),
+            "{linked}"
+        );
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "{linked}");
+        assert!(!repo.join(glue::AGENTS).exists(), "{linked}");
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".claude"), "").unwrap();
+    let err = glue::write(dir.path()).unwrap_err().to_string();
+    assert!(err.ends_with(".claude is not a directory"), "{err}");
 }

@@ -104,7 +104,9 @@ enum Command {
     /// command succeeds it writes the Tasks section into AGENTS.md between
     /// the sltk:tasks markers, .claude/hooks/session-start.sh, and the
     /// hook's SessionStart entry in .claude/settings.json, keeping the
-    /// file's other keys and hooks. Then it writes .github/sltk.toml,
+    /// file's other keys and hooks. It refuses, before writing any of them,
+    /// a hook it did not write, a ## Tasks heading outside the markers, and
+    /// a symlink in any of their paths. Then it writes .github/sltk.toml,
     /// pinning this sltk release and the sha256 of its archives, read from
     /// the release's .sha256 files. It reads those first, so it changes
     /// nothing when this sltk has no published release. Before the first

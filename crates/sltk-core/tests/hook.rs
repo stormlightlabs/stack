@@ -2,7 +2,8 @@
 //! project and home. A `.tar.xz` archive built here holds a stub `sltk` and
 //! stands in for the release download through `SLTK_HOOK_ARCHIVE`. The stub
 //! records its calls and, on `install --yes`, puts a stub `arcl` where
-//! `sltk install` would. A fake `uname` picks the target. Nothing here
+//! `sltk install` would, unless a test put one there first. A fake `uname`
+//! picks the target. Nothing here
 //! reaches the network.
 
 #![cfg(unix)]
@@ -109,14 +110,14 @@ impl Session {
 
 /// The stub `sltk`: answers `--version` with [`VERSION`], and on any other
 /// call records it in `$CALLS` and, for `install`, writes a stub `arcl` that
-/// records its calls the same way.
+/// records its calls the same way when there is no `arcl` yet.
 const STUB_SLTK: &str = r#"#!/bin/sh
 if [ "$1" = --version ]; then
   echo "sltk 9.8.7"
   exit 0
 fi
 echo "sltk $*" >> "$CALLS"
-if [ "$1" = install ]; then
+if [ "$1" = install ] && [ ! -e "$HOME/.cargo/bin/arcl" ]; then
   mkdir -p "$HOME/.cargo/bin"
   printf '#!/bin/sh\necho "arcl $*" >> "$CALLS"\n' > "$HOME/.cargo/bin/arcl"
   chmod 755 "$HOME/.cargo/bin/arcl"
@@ -301,4 +302,82 @@ fn a_local_session_is_left_alone() {
         .unwrap();
     assert!(output.status.success());
     assert!(!session.home.join(".local").exists());
+}
+
+/// A stub `arcl` that records its calls, fails `tree`, and runs `init` as
+/// `init_body` says.
+fn broken_db_session(init_body: &str) -> Session {
+    let session = Session::new("Linux x86_64");
+    std::fs::create_dir_all(session.home.join(".cargo/bin")).unwrap();
+    write_script(
+        &session.arcl(),
+        &format!(
+            "#!/bin/sh\necho \"arcl $*\" >> \"$CALLS\"\ncase \"$1\" in\n  tree) exit 1 ;;\n  init) {init_body} ;;\nesac\n"
+        ),
+    );
+    std::fs::create_dir_all(session.project.join(".arcl")).unwrap();
+    std::fs::write(session.project.join(".arcl/arcl.db"), "not a database").unwrap();
+    session
+}
+
+/// The one file under `.arcl` whose name starts `arcl.db-broken-`.
+fn moved_db(session: &Session) -> String {
+    let names: Vec<String> = std::fs::read_dir(session.project.join(".arcl"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("arcl.db-broken-"))
+        .collect();
+    assert_eq!(names.len(), 1, "{names:?}");
+    format!(".arcl/{}", names[0])
+}
+
+#[test]
+fn a_database_that_does_not_open_moves_aside_and_is_rebuilt() {
+    let session = broken_db_session("echo db > .arcl/arcl.db");
+    let output = session.run();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let moved = moved_db(&session);
+    assert_eq!(
+        std::fs::read_to_string(session.project.join(&moved)).unwrap(),
+        "not a database"
+    );
+    assert_eq!(
+        stderr(&output),
+        format!("session-start: .arcl/arcl.db did not open; moved it to {moved} and rebuilt it\n")
+    );
+    assert_eq!(
+        session.read_calls(),
+        "sltk install --yes\narcl tree\narcl init --quiet\narcl --version\n"
+    );
+}
+
+#[test]
+fn a_failed_rebuild_says_where_the_database_went_and_claims_no_rebuild() {
+    let session = broken_db_session("echo 'arcl: init failed' >&2; exit 1");
+    let output = session.run();
+    assert_eq!(output.status.code(), Some(1));
+    let moved = moved_db(&session);
+    assert!(!session.project.join(".arcl/arcl.db").exists());
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "arcl: init failed\nsession-start: .arcl/arcl.db did not open and is now {moved}; arcl init could not build a new one\n"
+        )
+    );
+    assert_eq!(
+        session.read_calls(),
+        "sltk install --yes\narcl tree\narcl init --quiet\n"
+    );
+}
+
+#[test]
+fn a_failed_first_build_names_the_database() {
+    let session = broken_db_session("exit 1");
+    std::fs::remove_file(session.project.join(".arcl/arcl.db")).unwrap();
+    let output = session.run();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        stderr(&output),
+        "session-start: arcl init could not build .arcl/arcl.db\n"
+    );
 }

@@ -89,6 +89,7 @@ fi
 # that fails to open moves aside under a name .arcl/.gitignore ignores, and
 # init builds a new one. The workspace in git holds the tasks either way.
 arcl=$cargo_bin/arcl
+broken=
 if [ -e .arcl/arcl.db ] && ! "$arcl" tree >/dev/null 2>&1; then
   broken=.arcl/arcl.db-broken-$(date +%Y%m%dT%H%M%S)
   for f in .arcl/arcl.db .arcl/arcl.db-wal .arcl/arcl.db-shm; do
@@ -96,9 +97,16 @@ if [ -e .arcl/arcl.db ] && ! "$arcl" tree >/dev/null 2>&1; then
       mv "$f" "$broken${f#.arcl/arcl.db}"
     fi
   done
-  echo "session-start: .arcl/arcl.db did not open; moved it to $broken and rebuilt it" >&2
 fi
 if [ ! -e .arcl/arcl.db ]; then
-  "$arcl" init --quiet
+  if ! "$arcl" init --quiet; then
+    if [ -n "$broken" ]; then
+      fail ".arcl/arcl.db did not open and is now $broken; arcl init could not build a new one"
+    fi
+    fail "arcl init could not build .arcl/arcl.db"
+  fi
+  if [ -n "$broken" ]; then
+    echo "session-start: .arcl/arcl.db did not open; moved it to $broken and rebuilt it" >&2
+  fi
 fi
 "$arcl" --version

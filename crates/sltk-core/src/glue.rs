@@ -2,7 +2,10 @@
 //! session hook, and the hook's entry in `.claude/settings.json`.
 //!
 //! Each writer leaves a file alone when it already holds what it would
-//! write, so a second run changes no byte. None follows a symlink.
+//! write, so a second run changes no byte. None follows a symlink, whether
+//! it is the file or a directory between the repository root and the file,
+//! so every write lands inside the repository. Every file is checked before
+//! any is written, so a refusal changes nothing.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -17,7 +20,8 @@ pub const HOOK: &str = ".claude/hooks/session-start.sh";
 pub const SETTINGS: &str = ".claude/settings.json";
 
 /// The command the SessionStart entry runs.
-pub const HOOK_COMMAND: &str = "$CLAUDE_PROJECT_DIR/.claude/hooks/session-start.sh";
+/// The variable is quoted so a project path with a space stays one word.
+pub const HOOK_COMMAND: &str = "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session-start.sh";
 
 /// The line that opens the Tasks section in AGENTS.md.
 pub const TASKS_BEGIN: &str = "<!-- sltk:tasks:begin -->";
@@ -41,40 +45,52 @@ pub enum GlueError {
     /// The file could not be read or written.
     #[error("sltk: {}: {source}", path.display())]
     Io { path: PathBuf, source: std::io::Error },
-    /// The file is a symlink or not a regular file.
+    /// The file, or a directory above it, is a symlink, or is not a regular
+    /// file or a directory.
     #[error("sltk: {} {reason}", path.display())]
     NotAFile { path: PathBuf, reason: &'static str },
-    /// The file holds something the writer cannot merge into, such as one
-    /// Tasks marker without the other, or settings that are not a JSON
-    /// object.
+    /// The file holds something the writer cannot merge into or replace,
+    /// such as one Tasks marker without the other, settings that are not a
+    /// JSON object, or a hook sltk did not write.
     #[error("sltk: {}: {reason}", path.display())]
     Content { path: PathBuf, reason: String },
 }
 
 /// Writes the Tasks section, the hook and its settings entry under `root`,
 /// and returns the paths, relative to `root`, of the files it changed.
+///
+/// Refuses a hook that differs from [`HOOK_SCRIPT`] rather than replace it.
+/// It checks all three files before writing any.
 pub fn write(root: &Path) -> Result<Vec<&'static str>, GlueError> {
+    let content = |relative: &str| {
+        let path = root.join(relative);
+        move |reason| GlueError::Content { path, reason }
+    };
+    let agents = read(root, AGENTS)?;
+    let agents_text = tasks_section(agents.as_deref()).map_err(content(AGENTS))?;
+    let hook = read(root, HOOK)?;
+    if hook.as_deref().is_some_and(|text| text != HOOK_SCRIPT) {
+        return Err(content(HOOK)(
+            "differs from the hook sltk writes, and sltk does not replace it. Adopting an existing hook \
+             comes in a later release; until then, move this one aside and rerun sltk init"
+                .to_owned(),
+        ));
+    }
+    let existing = read(root, SETTINGS)?;
+    let merged = settings(existing.as_deref()).map_err(content(SETTINGS))?;
+
     let mut changed = Vec::new();
-    let path = root.join(AGENTS);
-    let agents = read(&path)?;
-    let text = tasks_section(agents.as_deref()).map_err(|reason| GlueError::Content { path: path.clone(), reason })?;
-    if agents.as_deref() != Some(text.as_str()) {
-        replace(&path, &text, None)?;
+    if agents.as_deref() != Some(agents_text.as_str()) {
+        replace(&root.join(AGENTS), &agents_text, None)?;
         changed.push(AGENTS);
     }
-
     let path = root.join(HOOK);
-    let hook = read(&path)?;
-    if hook.as_deref() != Some(HOOK_SCRIPT) || !is_executable(&path) {
+    if hook.is_none() || !is_executable(&path) {
         replace(&path, HOOK_SCRIPT, Some(0o755))?;
         changed.push(HOOK);
     }
-
-    let path = root.join(SETTINGS);
-    let existing = read(&path)?;
-    let merged = settings(existing.as_deref()).map_err(|reason| GlueError::Content { path: path.clone(), reason })?;
     if let Some(text) = merged {
-        replace(&path, &text, None)?;
+        replace(&root.join(SETTINGS), &text, None)?;
         changed.push(SETTINGS);
     }
     Ok(changed)
@@ -84,7 +100,8 @@ pub fn write(root: &Path) -> Result<Vec<&'static str>, GlueError> {
 /// the marker lines replaced, or with the section appended after a blank
 /// line when it has neither marker. A missing file becomes the section
 /// alone. Fails when a marker line appears without the other, more than
-/// once, or out of order.
+/// once, or out of order, and when a `## Tasks` heading lies outside the
+/// markers, since the file would then hold two Tasks sections.
 pub fn tasks_section(existing: Option<&str>) -> Result<String, String> {
     let section = format!("{TASKS_BEGIN}\n{TASKS}{TASKS_END}\n");
     let Some(text) = existing.filter(|text| !text.is_empty()) else {
@@ -92,7 +109,17 @@ pub fn tasks_section(existing: Option<&str>) -> Result<String, String> {
     };
     let begins = marker_lines(text, TASKS_BEGIN);
     let ends = marker_lines(text, TASKS_END);
+    let heading_outside = |from: usize, to: usize| tasks_headings(text).into_iter().any(|at| at < from || at >= to);
+    let two_sections = || {
+        format!(
+            "has a ## Tasks heading outside the {TASKS_BEGIN} and {TASKS_END} lines, so sltk would add a \
+             second Tasks section. Delete that section, or put the marker lines around it for sltk to \
+             replace"
+        )
+    };
     match (begins.as_slice(), ends.as_slice()) {
+        ([], []) if heading_outside(0, 0) => Err(two_sections()),
+        ([begin], [end]) if begin < end && heading_outside(*begin, *end) => Err(two_sections()),
         ([], []) => {
             let gap = if text.ends_with("\n\n") {
                 ""
@@ -118,6 +145,11 @@ pub fn tasks_section(existing: Option<&str>) -> Result<String, String> {
 /// file becomes [`SETTINGS_TEMPLATE`]. An existing file keeps its other keys
 /// and hooks in their order and gains the entry at the end of
 /// `hooks.SessionStart`.
+///
+/// The new text is serde_json's, not an edit of the old bytes: it is
+/// indented with two spaces, a repeated key keeps only its last value, and
+/// an integer outside 64 bits comes back as a float. Claude Code reads such
+/// a file the same way, so only the bytes change.
 pub fn settings(existing: Option<&str>) -> Result<Option<String>, String> {
     let Some(text) = existing else {
         return Ok(Some(SETTINGS_TEMPLATE.to_owned()));
@@ -151,6 +183,24 @@ pub fn settings(existing: Option<&str>) -> Result<Option<String>, String> {
     Ok(Some(out))
 }
 
+/// The byte offsets of the lines in `text` that are a `## Tasks` heading,
+/// ignoring indentation, closing `#`s and a `\r\n` ending.
+fn tasks_headings(text: &str) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    let mut start = 0;
+    for line in text.split_inclusive('\n') {
+        let heading = line
+            .trim()
+            .strip_prefix("## ")
+            .map(|rest| rest.trim_end_matches('#').trim());
+        if heading == Some("Tasks") {
+            offsets.push(start);
+        }
+        start += line.len();
+    }
+    offsets
+}
+
 /// The byte offsets of the lines in `text` that are exactly `marker`, ignoring
 /// a `\n` or `\r\n` ending.
 fn marker_lines(text: &str, marker: &str) -> Vec<usize> {
@@ -166,26 +216,45 @@ fn marker_lines(text: &str, marker: &str) -> Vec<usize> {
     offsets
 }
 
-/// The text of the file at `path`, or `None` when there is none. Refuses a
-/// symlink and anything but a regular file.
-fn read(path: &Path) -> Result<Option<String>, GlueError> {
-    match std::fs::symlink_metadata(path) {
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(GlueError::Io { path: path.to_owned(), source }),
-        Ok(meta) if meta.file_type().is_symlink() => {
-            return Err(GlueError::NotAFile {
-                path: path.to_owned(),
-                reason: "is a symlink, which sltk does not follow",
-            });
+/// The text of the file at `relative` under `root`, or `None` when there is
+/// none. Refuses a symlink and anything but a regular file, in the file and
+/// in each directory between `root` and it.
+fn read(root: &Path, relative: &str) -> Result<Option<String>, GlueError> {
+    let path = root.join(relative);
+    let mut dir = root.to_path_buf();
+    for part in Path::new(relative).parent().into_iter().flat_map(Path::components) {
+        dir.push(part);
+        match kind(&dir)? {
+            None => return Ok(None),
+            Some(meta) if meta.is_dir() => {}
+            Some(_) => {
+                return Err(GlueError::NotAFile { path: dir, reason: "is not a directory" });
+            }
         }
-        Ok(meta) if !meta.is_file() => {
-            return Err(GlueError::NotAFile { path: path.to_owned(), reason: "is not a regular file" });
-        }
-        Ok(_) => {}
     }
-    std::fs::read_to_string(path)
+    match kind(&path)? {
+        None => return Ok(None),
+        Some(meta) if !meta.is_file() => {
+            return Err(GlueError::NotAFile { path, reason: "is not a regular file" });
+        }
+        Some(_) => {}
+    }
+    std::fs::read_to_string(&path)
         .map(Some)
-        .map_err(|source| GlueError::Io { path: path.to_owned(), source })
+        .map_err(|source| GlueError::Io { path, source })
+}
+
+/// The metadata of `path` itself, or `None` when there is nothing there.
+/// Refuses a symlink.
+fn kind(path: &Path) -> Result<Option<std::fs::Metadata>, GlueError> {
+    match std::fs::symlink_metadata(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(GlueError::Io { path: path.to_owned(), source }),
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Err(GlueError::NotAFile { path: path.to_owned(), reason: "is a symlink, which sltk does not follow" })
+        }
+        Ok(meta) => Ok(Some(meta)),
+    }
 }
 
 /// Writes `text` to a temporary file beside `path`, with `mode` on Unix when
@@ -287,6 +356,25 @@ mod tests {
         ] {
             let err = tasks_section(Some(&text)).unwrap_err();
             assert!(err.starts_with("needs one <!-- sltk:tasks:begin --> line"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_tasks_heading_outside_the_markers_is_refused() {
+        for text in [
+            "# A\n\n## Tasks\n\nOther rules.\n".to_owned(),
+            "# A\r\n\r\n  ## Tasks ##\r\n".to_owned(),
+            format!("## Tasks\n\n{TASKS_BEGIN}\nold\n{TASKS_END}\n"),
+            format!("{TASKS_BEGIN}\nold\n{TASKS_END}\n## Tasks\n"),
+        ] {
+            let err = tasks_section(Some(&text)).unwrap_err();
+            assert!(err.starts_with("has a ## Tasks heading outside"), "{text:?}: {err}");
+        }
+        for text in [
+            "# A\n\n## Tasks and bugs\n\n### Tasks\n".to_owned(),
+            format!("# A\n\n{TASKS_BEGIN}\n## Tasks\nold\n{TASKS_END}\n"),
+        ] {
+            assert!(tasks_section(Some(&text)).is_ok(), "{text:?}");
         }
     }
 
