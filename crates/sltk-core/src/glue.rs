@@ -137,43 +137,25 @@ pub fn write(root: &Path) -> Result<Vec<&'static str>, GlueError> {
 
 /// The changes the glue writers would make under `root`, without writing
 /// anything. `existing` says what to do with a hook or a Tasks section sltk
-/// did not write.
+/// did not write. Fails with the first file [`plan_each`] could not plan.
 pub fn plan(root: &Path, existing: Existing) -> Result<Vec<Change>, GlueError> {
-    let content = |relative: &str| {
-        let path = root.join(relative);
-        move |reason| GlueError::Content { path, reason }
-    };
-    let target = tasks_file(root)?;
-    let agents = read(root, target)?;
-    let agents_text = tasks_section_with(agents.as_deref(), existing).map_err(content(target))?;
-    let hook = read(root, HOOK)?;
-    if existing == Existing::Refuse && hook.as_deref().is_some_and(|text| text != HOOK_SCRIPT) {
-        return Err(content(HOOK)(
-            "differs from the hook sltk writes, and sltk init replaces a hook only when it adopts a \
-             repository that has .github/fabrial.toml. Move this one aside and rerun sltk init"
-                .to_owned(),
-        ));
-    }
-    let settings_text = read(root, SETTINGS)?;
-    let merged = settings(settings_text.as_deref()).map_err(content(SETTINGS))?;
-    let fab_text = read(root, FAB_SETTINGS)?;
-    let fab = fab_tasks(fab_text.as_deref()).map_err(content(FAB_SETTINGS))?;
+    plan_each(root, existing)
+        .into_iter()
+        .filter_map(Result::transpose)
+        .collect()
+}
 
-    let mut changes = Vec::new();
-    if agents.as_deref() != Some(agents_text.as_str()) {
-        changes.push(Change { path: target, old: agents, new: agents_text, old_mode: None, mode: None });
-    }
-    let old_mode = hook.as_ref().and_then(|_| mode_of(&root.join(HOOK)));
-    if hook.as_deref() != Some(HOOK_SCRIPT) || !old_mode.is_none_or(|mode| mode & 0o111 == 0o111) {
-        changes.push(Change { path: HOOK, old: hook, new: HOOK_SCRIPT.to_owned(), old_mode, mode: Some(HOOK_MODE) });
-    }
-    if let Some(text) = merged {
-        changes.push(Change { path: SETTINGS, old: settings_text, new: text, old_mode: None, mode: None });
-    }
-    if let Some(text) = fab {
-        changes.push(Change { path: FAB_SETTINGS, old: fab_text, new: text, old_mode: None, mode: None });
-    }
-    Ok(changes)
+/// Plans each glue file on its own, so one that cannot be planned does not
+/// hide the others: the Tasks file, the hook, the settings and fab's
+/// settings, in that order. Each gives the change [`plan`] would make,
+/// `None` when the file already matches, or why it cannot be planned.
+pub fn plan_each(root: &Path, existing: Existing) -> Vec<Result<Option<Change>, GlueError>> {
+    vec![
+        plan_tasks(root, existing),
+        plan_hook(root, existing),
+        plan_settings(root),
+        plan_fab(root),
+    ]
 }
 
 /// Writes each change under `root`, and returns the paths it wrote.
@@ -382,6 +364,51 @@ pub fn fab_tasks(existing: Option<&str>) -> Result<Option<String>, String> {
 
 /// The byte offsets of the lines outside code fences that are a `## Tasks`
 /// heading, ignoring up to three spaces of indentation, closing `#`s and a
+/// The [`GlueError::Content`] for `relative` under `root`.
+fn content(root: &Path, relative: &str) -> impl FnOnce(String) -> GlueError {
+    let path = root.join(relative);
+    move |reason| GlueError::Content { path, reason }
+}
+
+/// The Tasks section's change, in the file [`tasks_file`] picks.
+fn plan_tasks(root: &Path, existing: Existing) -> Result<Option<Change>, GlueError> {
+    let target = tasks_file(root)?;
+    let old = read(root, target)?;
+    let new = tasks_section_with(old.as_deref(), existing).map_err(content(root, target))?;
+    let same = old.as_deref() == Some(new.as_str());
+    Ok((!same).then_some(Change { path: target, old, new, old_mode: None, mode: None }))
+}
+
+/// The hook's change, when its text or mode differs. With
+/// [`Existing::Refuse`], a hook sltk did not write is an error.
+fn plan_hook(root: &Path, existing: Existing) -> Result<Option<Change>, GlueError> {
+    let old = read(root, HOOK)?;
+    if existing == Existing::Refuse && old.as_deref().is_some_and(|text| text != HOOK_SCRIPT) {
+        return Err(content(root, HOOK)(
+            "differs from the hook sltk writes, and sltk init replaces a hook only when it adopts a \
+             repository that has .github/fabrial.toml. Move this one aside and rerun sltk init"
+                .to_owned(),
+        ));
+    }
+    let old_mode = old.as_ref().and_then(|_| mode_of(&root.join(HOOK)));
+    let same = old.as_deref() == Some(HOOK_SCRIPT) && old_mode.is_none_or(|mode| mode & 0o111 == 0o111);
+    Ok((!same).then(|| Change { path: HOOK, old, new: HOOK_SCRIPT.to_owned(), old_mode, mode: Some(HOOK_MODE) }))
+}
+
+/// The SessionStart entry's change to [`SETTINGS`].
+fn plan_settings(root: &Path) -> Result<Option<Change>, GlueError> {
+    let old = read(root, SETTINGS)?;
+    let new = settings(old.as_deref()).map_err(content(root, SETTINGS))?;
+    Ok(new.map(|new| Change { path: SETTINGS, old, new, old_mode: None, mode: None }))
+}
+
+/// The `[tasks]` table's change to [`FAB_SETTINGS`].
+fn plan_fab(root: &Path) -> Result<Option<Change>, GlueError> {
+    let old = read(root, FAB_SETTINGS)?;
+    let new = fab_tasks(old.as_deref()).map_err(content(root, FAB_SETTINGS))?;
+    Ok(new.map(|new| Change { path: FAB_SETTINGS, old, new, old_mode: None, mode: None }))
+}
+
 /// `\r\n` ending.
 fn tasks_headings(lines: &[Line]) -> Vec<usize> {
     lines

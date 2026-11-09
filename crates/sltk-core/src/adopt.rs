@@ -12,10 +12,11 @@
 //! adoption leaves no pin and a rerun adopts again.
 //!
 //! Adoption keeps fab's settings: it runs `fab update`, which keeps them,
-//! rather than `fab init`. Settings from before fab 0.9.0 name no App, and
-//! `fab update` needs one, so adoption passes `--app` to it then, and
-//! `--secret-prefix` when given and the settings name none. It replaces a hand-copied session hook, and
-//! rewrites the one `## Tasks` section outside the markers in place.
+//! rather than `fab init`. Settings from fab 0.9.0 or earlier name no App,
+//! and `fab update` needs one, so adoption passes `--app` to it then, and
+//! `--secret-prefix` when given and the settings name none. It replaces a
+//! hand-copied session hook, and rewrites the one `## Tasks` section outside
+//! the markers in place.
 
 use std::ffi::OsStr;
 use std::io::Write;

@@ -1,7 +1,7 @@
 //! `sltk check`: where a repository has drifted from what `sltk init` sets
 //! up. It compares the pin with the installed tools through [`doctor`], runs
 //! `fab check` and `arcl skill install --check`, and compares the glue with
-//! what [`glue::plan`] would write. It writes nothing, fixes nothing and asks
+//! what [`glue::plan_each`] would write. It writes nothing, fixes nothing and asks
 //! nothing.
 //!
 //! Every input comes in through the repository root and a [`Machine`], so
@@ -59,11 +59,6 @@ pub enum Drift {
         /// How it differs, as "is missing".
         how: &'static str,
     },
-    /// A glue file holds something `sltk init` would refuse to replace.
-    GlueRefused {
-        /// The file and the reason, as `glue` words them.
-        reason: String,
-    },
 }
 
 impl fmt::Display for Drift {
@@ -80,7 +75,6 @@ impl fmt::Display for Drift {
             Drift::Fab(line) => write!(f, "fab check: {line}"),
             Drift::Skill(line) => write!(f, "arcl skill install --check: {line}"),
             Drift::Glue { path, how } => write!(f, "{path}: {how}"),
-            Drift::GlueRefused { reason } => write!(f, "{reason}"),
         }
     }
 }
@@ -200,29 +194,27 @@ fn check_skill(root: &Path, machine: &Machine, report: &mut Report) {
 }
 
 /// Compares the glue with what `sltk init` writes when it adopts the
-/// repository, which replaces a hook or Tasks section it did not write.
+/// repository, which replaces a hook or Tasks section it did not write. Each
+/// file is compared on its own. A file sltk init would refuse, or could not
+/// read, has no text to compare with, so it is a check that did not finish.
 fn check_glue(root: &Path, report: &mut Report) {
     let relative = |path: &Path| path.strip_prefix(root).unwrap_or(path).display().to_string();
-    match glue::plan(root, Existing::Replace) {
-        Ok(changes) => report.drift.extend(
-            changes
-                .iter()
-                .map(|change| Drift::Glue { path: change.path, how: describe(change) }),
-        ),
-        Err(GlueError::Content { path, reason }) => {
-            report
+    for planned in glue::plan_each(root, Existing::Replace) {
+        match planned {
+            Ok(None) => {}
+            Ok(Some(change)) => report
                 .drift
-                .push(Drift::GlueRefused { reason: format!("{}: {reason}", relative(&path)) });
-        }
-        Err(GlueError::NotAFile { path, reason }) => {
-            report
-                .drift
-                .push(Drift::GlueRefused { reason: format!("{} {reason}", relative(&path)) });
-        }
-        Err(GlueError::Io { path, source }) => {
-            report
+                .push(Drift::Glue { path: change.path, how: describe(&change) }),
+            Err(GlueError::Content { path, reason }) => report.errors.push(format!(
+                "could not check {}: sltk init would refuse it: {reason}",
+                relative(&path)
+            )),
+            Err(GlueError::NotAFile { path, reason }) => report
                 .errors
-                .push(format!("could not read {}: {source}", relative(&path)));
+                .push(format!("could not check {}: it {reason}", relative(&path))),
+            Err(GlueError::Io { path, source }) => report
+                .errors
+                .push(format!("could not read {}: {source}", relative(&path))),
         }
     }
 }
@@ -492,15 +484,72 @@ mod tests {
     }
 
     #[test]
-    fn glue_sltk_init_would_refuse_is_drift() {
+    fn glue_sltk_init_would_refuse_is_a_check_that_did_not_finish() {
         let fixture = Fixture::new();
         let agents = fixture.root.join(glue::AGENTS);
         std::fs::write(&agents, format!("{}\n", glue::TASKS_BEGIN)).unwrap();
-        let lines = fixture.lines();
-        assert_eq!(lines.len(), 1, "{lines:?}");
+        let report = fixture.check();
+        assert_eq!(report.drift, []);
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
         assert!(
-            lines[0].starts_with("AGENTS.md: needs one <!-- sltk:tasks:begin --> line"),
-            "{lines:?}"
+            report.errors[0].starts_with(
+                "could not check AGENTS.md: sltk init would refuse it: needs one <!-- sltk:tasks:begin --> line"
+            ),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn a_refused_glue_file_does_not_hide_drift_in_the_others() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join(glue::HOOK), "#!/bin/sh\nversion=0.3.0\n").unwrap();
+        let fab = fixture.root.join(FAB_SETTINGS);
+        let text = std::fs::read_to_string(&fab).unwrap();
+        std::fs::write(&fab, format!("{text}owner = \n")).unwrap();
+        let report = fixture.check();
+        assert_eq!(
+            report.drift.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
+            [".claude/hooks/session-start.sh: differs from the hook sltk init writes"]
+        );
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert!(
+            report.errors[0].starts_with("could not check .github/fabrial.toml: sltk init would refuse it: "),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn a_symlinked_or_oversized_pin_is_refused() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join(pin::PATH);
+        let real = fixture.root.join(".github/real.toml");
+        std::fs::rename(&path, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &path).unwrap();
+        assert_eq!(
+            fixture.lines(),
+            [".github/sltk.toml is a symlink; sltk check read no pin"]
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, "#".repeat(64 * 1024 + 1)).unwrap();
+        assert_eq!(
+            fixture.lines(),
+            [".github/sltk.toml is larger than 64 KiB; sltk check read no pin"]
+        );
+    }
+
+    #[test]
+    fn a_pin_that_cannot_be_read_is_an_error() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join(pin::PATH), b"version = \"\xff\"\n").unwrap();
+        let report = fixture.check();
+        assert_eq!(report.drift, []);
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert!(
+            report.errors[0].starts_with("could not read the pin: "),
+            "{:?}",
+            report.errors
         );
     }
 

@@ -110,11 +110,12 @@ enum Command {
     /// file it names. It compares the session hook, its SessionStart entry
     /// in .claude/settings.json, the Tasks section and the [tasks] table in
     /// .github/fabrial.toml with what sltk init writes when it adopts the
-    /// repository, and reports a file sltk init would refuse. It asks
-    /// nothing, so it runs the same off a terminal.
+    /// repository, each file on its own. It asks nothing, so it runs the
+    /// same off a terminal.
     ///
     /// Exits 0 when nothing differs, 1 when something does, and 2 when a
-    /// check could not run or finish, as when fab is not on PATH.
+    /// check could not run or finish, as when fab is not on PATH or sltk init
+    /// would refuse a glue file.
     Check {
         /// The repository root.
         #[arg(long)]
