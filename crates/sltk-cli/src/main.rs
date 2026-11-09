@@ -8,7 +8,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use sltk_core::doctor::{self, Machine, Report};
+use sltk_core::doctor::{self, Machine, Note, Report};
+use sltk_core::host::{self, GitHub};
 use sltk_core::install::{self, HttpFetch, InstallError};
 use sltk_core::platform::{Host, Plan};
 use sltk_core::train::{Tier, Train};
@@ -78,8 +79,17 @@ enum Command {
     /// before the bin directory's, and whether that one is Homebrew's, a bin
     /// directory missing from PATH, a pin of another sltk release, and a pin
     /// it will not read: a symlink, not a regular file, or over 64 KiB.
+    ///
+    /// Inside a git repository whose remote origin is on GitHub, it also
+    /// asks GitHub through `gh api` whether stormlight-thunderbot is
+    /// installed, THUNDERBOT_APP_ID and THUNDERBOT_PRIVATE_KEY are available
+    /// to the repository, and storm/review is required on main. Without gh
+    /// or a GitHub origin it skips these and says so. An answer gh could not
+    /// give, as when the token lacks a permission, is printed as "could not
+    /// check" and is not a problem.
+    ///
     /// Exits 0 when nothing is wrong, 1 when something is, and 2 when it
-    /// could not check, as when the pin cannot be read or parsed.
+    /// could not check the tools, as when the pin cannot be read or parsed.
     Doctor,
     /// Set up this repository: run fab's and arcl's setup, then write the pin.
     ///
@@ -270,22 +280,35 @@ fn run_doctor(train: &Train) -> Result<u8, (u8, String)> {
         Some(root) => Some(doctor::read_pin(&root, train, sltk_core::VERSION).map_err(|err| error(&err))?),
         None => None,
     };
-    let report = doctor::check(train, pin.as_ref(), sltk_core::VERSION, &machine);
+    let mut report = doctor::check(train, pin.as_ref(), sltk_core::VERSION, &machine);
+    if let Some(root) = doctor::find_repo_root(&cwd) {
+        match GitHub::detect(root, machine.path.as_deref(), host::HOST_TIMEOUT, host::HOST_DEADLINE) {
+            Ok(github) => doctor::check_repository(&github, &mut report),
+            Err(reason) => report.notes.push(Note::Skipped { reason }),
+        }
+    }
     print!("{}", doctor_report(&report, &machine));
     Ok(if report.findings.is_empty() { 0 } else { FAILED })
 }
 
-/// What `sltk doctor` prints: one line per finding, then a line naming the
-/// tools checked and how many problems it found.
+/// What `sltk doctor` prints: one line per finding, one per repository check
+/// it skipped or could not finish, then a line naming what it checked and how
+/// many problems it found.
 fn doctor_report(report: &Report, machine: &Machine) -> String {
     let mut out: String = report.findings.iter().map(|finding| format!("{finding}\n")).collect();
+    out.extend(report.notes.iter().map(|note| format!("{note}\n")));
+    let repository = report
+        .repository
+        .as_ref()
+        .map(|repository| format!(" and {repository}"))
+        .unwrap_or_default();
     let problems = match report.findings.len() {
         0 => "no problems".to_owned(),
         1 => "1 problem".to_owned(),
         n => format!("{n} problems"),
     };
     out.push_str(&format!(
-        "sltk doctor: checked {} in {}: {problems}\n",
+        "sltk doctor: checked {} in {}{repository}: {problems}\n",
         report.checked.join(", "),
         machine.bin.display()
     ));
@@ -332,7 +355,7 @@ mod tests {
 
     use sltk_core::install::InstallError;
 
-    use sltk_core::doctor::{Finding, Machine, Report};
+    use sltk_core::doctor::{Finding, Machine, Note, Report};
 
     use super::{
         Choices, Cli, DECLINED, DECLINED_LINE, FAILED, PARTIAL, QUESTION, doctor_report, install_exit_code,
@@ -628,7 +651,12 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
             brew_prefixes: Vec::new(),
             timeout: std::time::Duration::from_secs(5),
         };
-        let mut report = Report { checked: vec!["fab".into(), "arcl".into()], findings: Vec::new() };
+        let mut report = Report {
+            checked: vec!["fab".into(), "arcl".into()],
+            findings: Vec::new(),
+            repository: None,
+            notes: Vec::new(),
+        };
         assert_eq!(
             doctor_report(&report, &machine),
             "sltk doctor: checked fab, arcl in /h/.cargo/bin: no problems\n"
@@ -642,6 +670,42 @@ sha256 = "81cf21ffd2140482a4ea315e60ca34ead891c18e9aa65e7f05daf7fda2404498"
             "PATH does not include /h/.cargo/bin\n\
              arcl: /h/.cargo/bin/arcl is not installed\n\
              sltk doctor: checked fab, arcl in /h/.cargo/bin: 2 problems\n"
+        );
+    }
+
+    #[test]
+    fn doctor_prints_repository_findings_and_notes_before_the_summary() {
+        let machine = Machine {
+            path: None,
+            bin: PathBuf::from("/h/.cargo/bin"),
+            brew_prefixes: Vec::new(),
+            timeout: std::time::Duration::from_secs(5),
+        };
+        let report = Report {
+            checked: vec!["fab".into(), "arcl".into()],
+            findings: vec![Finding::SecretMissing { name: "THUNDERBOT_APP_ID".into() }],
+            repository: Some("o/r on GitHub".into()),
+            notes: vec![Note::CouldNotCheck {
+                what: "secret THUNDERBOT_PRIVATE_KEY".into(),
+                reason: "HTTP 403".into(),
+            }],
+        };
+        assert_eq!(
+            doctor_report(&report, &machine),
+            "secret THUNDERBOT_APP_ID is not available to this repository\n\
+             could not check secret THUNDERBOT_PRIVATE_KEY: HTTP 403\n\
+             sltk doctor: checked fab, arcl in /h/.cargo/bin and o/r on GitHub: 1 problem\n"
+        );
+        let skipped = Report {
+            checked: vec!["fab".into()],
+            findings: Vec::new(),
+            repository: None,
+            notes: vec![Note::Skipped { reason: "gh not found".into() }],
+        };
+        assert_eq!(
+            doctor_report(&skipped, &machine),
+            "skipped repository checks: gh not found\n\
+             sltk doctor: checked fab in /h/.cargo/bin: no problems\n"
         );
     }
 }
