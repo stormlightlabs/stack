@@ -14,15 +14,14 @@ pins a set of their versions and runs them together.
 Each repository that uses the stack sets it up by hand, and the copies have
 drifted:
 
-- `.github/fabrial.toml` pins fab 0.8.0 in dalil, fabrial and cloud, 0.7.1 in
-  mire and 0.4.0 in arclightning.
+- `.github/fabrial.toml` pins fab 0.8.0 in dalil and fabrial, 0.7.1 in mire
+  and 0.4.0 in arclightning.
 - `arcl skill install` was never run in dalil, and mire's copy of the
   arclightning skill differs from the one in arclightning's `skills/`.
 - dalil and fabrial each carry a `.claude/hooks/session-start.sh` copied by
   hand; the two differ only in comments. Each pins arcl 0.3.0 twice: in the
   script, and in dalil's AGENTS.md Tasks section or fabrial's PLAN.md Work
   section.
-- cloud's `scripts/dev-setup.sh` pins fab and arcl a third way.
 
 Each binary already has a one-line install. fab, arcl and mire all release
 with cargo-dist 0.32, publish a shell installer, push a formula to
@@ -110,8 +109,7 @@ it.
   templates, and those copies are the drift this tool removes.
 - The session hook installs the pinned `sltk`, runs `sltk install --yes` from
   `.github/sltk.toml`, then builds the arcl cache. It replaces the hand-copied
-  `session-start.sh`. cloud's `dev-setup.sh` calls `sltk` for fab and arcl and
-  keeps installing its other tools itself.
+  `session-start.sh`.
 - The hook reads the `sltk` version from `.github/sltk.toml` with a shell
   one-liner, so the version lives in one place. `sltk` writes it as one line,
   `version = "x.y.z"`, and the hook fails when it finds none. A version
@@ -219,8 +217,7 @@ it.
 - The prototype session hook in PR #4: it read arcl 0.3.0 from a test
   `sltk.toml` with the shell one-liner and installed it in a Claude cloud
   session.
-- `dalil/.claude/hooks/session-start.sh`,
-  `fabrial/.claude/hooks/session-start.sh` and `cloud/scripts/dev-setup.sh`:
-  the hand-copied pins.
+- `dalil/.claude/hooks/session-start.sh` and
+  `fabrial/.claude/hooks/session-start.sh`: the hand-copied pins.
 - formulae.brew.sh and crates.io, checked 2026-11-03: `stk` is a Homebrew
   formula and a crate; `sltk` is neither.
