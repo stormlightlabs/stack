@@ -282,7 +282,7 @@ fn run_doctor(train: &Train) -> Result<u8, (u8, String)> {
     };
     let mut report = doctor::check(train, pin.as_ref(), sltk_core::VERSION, &machine);
     if let Some(root) = doctor::find_repo_root(&cwd) {
-        match GitHub::detect(root, machine.path.as_deref(), host::HOST_TIMEOUT) {
+        match GitHub::detect(root, machine.path.as_deref(), host::HOST_TIMEOUT, host::HOST_DEADLINE) {
             Ok(github) => doctor::check_repository(&github, &mut report),
             Err(reason) => report.notes.push(Note::Skipped { reason }),
         }

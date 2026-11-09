@@ -1,12 +1,14 @@
 //! Code `sltk` shares between its crates: the release number the CLI reports,
 //! the release train it pins, the install plan, the install itself, the
-//! doctor's checks and repository setup.
+//! doctor's checks, the repository's host, capped child processes and
+//! repository setup.
 
 pub mod doctor;
 pub mod host;
 pub mod install;
 pub mod pin;
 pub mod platform;
+pub mod process;
 pub mod setup;
 pub mod train;
 

@@ -5,16 +5,21 @@
 //! [`Host`] is the interface and [`GitHub`] its one implementation, which asks
 //! through `gh api`. Tests use a fake.
 
+use std::cell::OnceCell;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::doctor::run_capped;
+use crate::process::run_capped;
 use crate::setup::find_program;
 
 /// How long one `gh api` or `git` call may run before doctor stops it.
 pub const HOST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long all the calls for one repository may run together. A call still
+/// running at this point is stopped, and the calls after it are not made.
+pub const HOST_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The most bytes doctor reads from one `gh api` or `git` call.
 const MAX_HOST_OUTPUT: u64 = 256 * 1024;
@@ -63,15 +68,24 @@ pub struct GitHub {
     repo: String,
     /// How long each `gh api` call may run.
     timeout: Duration,
+    /// How long all the calls may run together, from [`GitHub::detect`].
+    total: Duration,
+    /// When the calls must stop: `total` after [`GitHub::detect`] started.
+    deadline: Instant,
+    /// The secret names the repository and organization endpoints list,
+    /// read once for every secret asked about.
+    secrets: OnceCell<[Result<Vec<String>, String>; 2]>,
 }
 
 impl GitHub {
     /// The GitHub repository the remote `origin` of the git repository at
     /// `root` names, asked about through the `gh` on `path`. `gh` and `git`
-    /// are found in absolute `PATH` entries only. The error is why doctor
-    /// skips the repository checks: `gh` or `git` is not on `path`, there is
-    /// no `origin`, or `origin` is not on GitHub.
-    pub fn detect(root: &Path, path: Option<&OsStr>, timeout: Duration) -> Result<GitHub, String> {
+    /// are found in absolute `PATH` entries only. Each call may run for
+    /// `timeout`, and all of them, this one's `git` included, for `total`.
+    /// The error is why doctor skips the repository checks: `gh` or `git` is
+    /// not on `path`, there is no `origin`, or `origin` is not on GitHub.
+    pub fn detect(root: &Path, path: Option<&OsStr>, timeout: Duration, total: Duration) -> Result<GitHub, String> {
+        let deadline = Instant::now() + total;
         let gh = find_program("gh", path).ok_or("gh not found")?;
         let git = find_program("git", path).ok_or("git not found")?;
         let mut command = Command::new(git);
@@ -79,24 +93,31 @@ impl GitHub {
         if let Some(path) = path {
             command.env("PATH", path);
         }
-        let output = run_capped(&mut command, timeout, MAX_HOST_OUTPUT)
+        let output = run_capped(&mut command, timeout.min(total), MAX_HOST_OUTPUT)
             .map_err(|err| format!("could not read the remote origin: git: {err}"))?;
         if !output.status.success() {
             return Err("no remote named origin".to_owned());
         }
         let (owner, repo) = parse_remote(output.stdout.trim()).ok_or("origin is not a GitHub repository")?;
-        Ok(GitHub { gh, owner, repo, timeout })
+        Ok(GitHub { gh, owner, repo, timeout, total, deadline, secrets: OnceCell::new() })
     }
 
     /// Runs `gh api` on `endpoint`, every page, filtered by `jq`, and returns
     /// the lines it printed.
     fn api(&self, endpoint: &str, jq: &str) -> Result<Vec<String>, ApiError> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(ApiError::Other(format!(
+                "not asked, since the repository checks ran past {} s",
+                self.total.as_secs_f32()
+            )));
+        }
         let mut command = Command::new(&self.gh);
         command
             .args(["api", "--hostname", "github.com", "--paginate", "--jq", jq, endpoint])
             .env("GH_PROMPT_DISABLED", "1")
             .env("GH_NO_UPDATE_NOTIFIER", "1");
-        let output = run_capped(&mut command, self.timeout, MAX_HOST_OUTPUT)
+        let output = run_capped(&mut command, self.timeout.min(left), MAX_HOST_OUTPUT)
             .map_err(|err| ApiError::Other(format!("gh: {err}")))?;
         if output.status.success() {
             return Ok(output.stdout.lines().map(str::to_owned).collect());
@@ -119,6 +140,20 @@ impl GitHub {
     fn secret_names(&self, endpoint: &str) -> Result<Vec<String>, String> {
         self.api(endpoint, ".secrets[].name")
             .map_err(|err| err.reason().to_owned())
+    }
+
+    /// The repository's own secrets and the organization secrets shared
+    /// with it, listed on the first call and kept for the rest.
+    fn secret_lists(&self) -> &[Result<Vec<String>, String>; 2] {
+        self.secrets.get_or_init(|| {
+            [
+                self.secret_names(&format!("repos/{}/{}/actions/secrets", self.owner, self.repo)),
+                self.secret_names(&format!(
+                    "repos/{}/{}/actions/organization-secrets",
+                    self.owner, self.repo
+                )),
+            ]
+        })
     }
 }
 
@@ -160,14 +195,10 @@ impl Host for GitHub {
     }
 
     /// Looks in the repository's own secrets and in the organization secrets
-    /// shared with it. Listing either needs admin access to the repository.
+    /// shared with it, which are listed once for all the secrets asked about.
+    /// Listing either needs admin access to the repository.
     fn secret_available(&self, name: &str) -> Answer {
-        let repo = self.secret_names(&format!("repos/{}/{}/actions/secrets", self.owner, self.repo));
-        let org = self.secret_names(&format!(
-            "repos/{}/{}/actions/organization-secrets",
-            self.owner, self.repo
-        ));
-        find_in([repo, org], name)
+        find_in(self.secret_lists().clone(), name)
     }
 
     /// Looks in the rulesets that apply to `branch` and in its classic branch
@@ -270,7 +301,7 @@ fn clean(line: &str) -> String {
 mod tests {
     use std::ffi::OsString;
 
-    use super::{Answer, GitHub, HOST_TIMEOUT, find_in, parse_remote};
+    use super::{Answer, GitHub, HOST_DEADLINE, HOST_TIMEOUT, find_in, parse_remote};
 
     #[test]
     fn a_remote_url_names_a_github_repository_or_none() {
@@ -309,10 +340,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // A PATH whose one directory holds no gh, and no PATH at all.
         let path = OsString::from(dir.path());
-        let err = GitHub::detect(dir.path(), Some(&path), HOST_TIMEOUT).unwrap_err();
+        let err = GitHub::detect(dir.path(), Some(&path), HOST_TIMEOUT, HOST_DEADLINE).unwrap_err();
         assert_eq!(err, "gh not found");
         assert_eq!(
-            GitHub::detect(dir.path(), None, HOST_TIMEOUT).unwrap_err(),
+            GitHub::detect(dir.path(), None, HOST_TIMEOUT, HOST_DEADLINE).unwrap_err(),
             "gh not found"
         );
     }
