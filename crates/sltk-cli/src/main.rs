@@ -1,8 +1,10 @@
 //! `sltk`, the storm stack's command-line interface.
 
+mod init;
 mod prompt;
 
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -79,6 +81,42 @@ enum Command {
     /// Exits 0 when nothing is wrong, 1 when something is, and 2 when it
     /// could not check, as when the pin cannot be read or parsed.
     Doctor,
+    /// Set up this repository: run fab's and arcl's setup, then write the pin.
+    ///
+    /// Runs `fab init` with --owner, --trailer and --gates, then
+    /// `arcl init --workspace` and `arcl skill install`, in the repository
+    /// root: --dir, or the top of the git repository holding the current
+    /// directory. On a terminal it asks for each of the three settings left
+    /// out; off a terminal a missing one is an error. It stops at the first
+    /// command that fails and names the commands that ran and the ones that
+    /// did not; rerunning with the same flags finishes the setup. When every
+    /// command succeeds it writes .github/sltk.toml, pinning this sltk
+    /// release and the sha256 of its archives, read from the release's
+    /// .sha256 files. It reads those first, so it changes nothing when this
+    /// sltk has no published release. Before the first command it records
+    /// the flags and the train's fab version in sltk-init in the git
+    /// directory, and removes that record after writing the pin. It refuses
+    /// a repository that already has .github/sltk.toml, or any
+    /// .github/fabrial.toml but one an earlier run left: the record matches
+    /// the flags, and the file holds the same settings and the train's fab
+    /// version. Then it skips `fab init`. Exits 0 when set up, 1 otherwise.
+    Init {
+        /// GitHub login of the person who approves pull requests.
+        #[arg(long)]
+        owner: Option<String>,
+        /// The squash commit's Co-authored-by value, as "Name <email>".
+        #[arg(long)]
+        trailer: Option<String>,
+        /// The command agents run before pushing.
+        #[arg(long)]
+        gates: Option<String>,
+        /// Also pin this optional tool. Repeat for more than one.
+        #[arg(long = "with", value_name = "TOOL")]
+        with: Vec<String>,
+        /// The repository root.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
 }
 
 /// What a person chose for `sltk install`, by flag or by where it runs.
@@ -124,6 +162,11 @@ fn main() -> ExitCode {
             )
         }
         Command::Doctor => run_doctor(&train),
+        Command::Init { owner, trailer, gates, with, dir } => {
+            let flags = init::Flags { owner, trailer, gates, with, dir };
+            let (mut input, mut output) = (io::stdin().lock(), io::stdout().lock());
+            init::run(&train, &flags, on_terminal(), &mut input, &mut output)
+        }
     };
     match result {
         Ok(code) => ExitCode::from(code),
