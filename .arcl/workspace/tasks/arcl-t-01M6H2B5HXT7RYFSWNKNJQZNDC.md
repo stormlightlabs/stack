@@ -12,9 +12,19 @@ Every repository that uses fabrial runs on `sltk`.
 ## Stop rule
 
 `sltk check` passes on `main` in dalil, fabrial, mire, arclightning
-and each private stormlightlabs repository with `.github/fabrial.toml`
-on `main`. `gh repo list stormlightlabs --visibility private` lists
-the private repositories to check.
+and each repository in the private set.
+
+The private set is the private stormlightlabs repositories that have
+`.github/fabrial.toml` on `main` when this task starts. A repository
+that adopts fabrial later gets its own task and does not reopen this
+one. The owner records the set in their private tracker, not here.
+
+Only the owner, or a member with access to the organization, can see
+the private set. They list the candidates with
+`gh repo list stormlightlabs --visibility private` and keep each one
+where
+`gh api 'repos/stormlightlabs/<repo>/contents/.github/fabrial.toml?ref=main'`
+succeeds.
 
 ## Must not absorb
 
